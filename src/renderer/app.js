@@ -1072,7 +1072,7 @@ function renderDocsTab(root) {
         <div class="docs-nav">
           ${window.NC_DOCS.map(d => `<button data-id="${d.id}" class="${d.id === doc.id ? 'active' : ''}">${d.title}</button>`).join('')}
         </div>
-        <div class="docs-body">${doc.body}</div>
+        <div class="docs-body" style="user-select: text;">${doc.body}</div>
       </div>
     </div>
   `;
