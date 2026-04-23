@@ -537,6 +537,12 @@ async function saveEditor() {
     patch.tokenizer = null;
     patch.metrics = [];
   }
+  // Always clear the stored tokenizer when the tokenizer kind changes so that
+  // the next training run rebuilds the vocab from scratch. This runs regardless
+  // of whether the network has been trained (n.state may be null).
+  if (a.kind === 'charLM' && a.tokenizerKind !== n.architecture.tokenizerKind) {
+    patch.tokenizer = null;
+  }
   try {
     await window.nc.networks.update(n.id, patch);
     await refreshNetworks();
