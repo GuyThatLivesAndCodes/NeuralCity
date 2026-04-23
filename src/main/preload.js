@@ -29,6 +29,13 @@ contextBridge.exposeInMainWorld('nc', {
     list: () => ipcRenderer.invoke('api:list'),
     onLog: (cb) => ipcRenderer.on('api:log', (_, l) => cb(l))
   },
+  backups: {
+    list:     (netId)           => ipcRenderer.invoke('backups:list', netId),
+    create:   (netId, label)    => ipcRenderer.invoke('backups:create', netId, label),
+    delete:   (netId, backupId) => ipcRenderer.invoke('backups:delete', netId, backupId),
+    restore:  (netId, backupId) => ipcRenderer.invoke('backups:restore', netId, backupId),
+    download: (netId, backupId) => ipcRenderer.invoke('backups:download', netId, backupId)
+  },
   script: {
     run: (id, code) => ipcRenderer.invoke('script:run', id, code)
   },

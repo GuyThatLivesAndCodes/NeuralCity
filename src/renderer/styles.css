@@ -385,3 +385,18 @@ button { cursor: pointer; }
 }
 .chat-edit-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .chat-edit-row .hint { font-size: 11px; color: var(--fg-muted); }
+
+/* ── Backup modal ─────────────────────────────────────────────────────── */
+.backup-empty {
+  padding: 32px 20px; text-align: center;
+}
+.backup-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.backup-item:last-child { border-bottom: none; }
+.backup-info { flex: 1; min-width: 0; }
+.backup-label { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.backup-meta { font-size: 11px; color: var(--fg-muted); margin-top: 2px; }
+.backup-btns { display: flex; gap: 6px; flex-shrink: 0; }

@@ -70,12 +70,20 @@ window.NC_DOCS = [
 <p>Each operator — <code>matmul</code>, <code>relu</code>, <code>gelu</code>, <code>softmax</code>, <code>embedding</code>, and others — implements its own local derivative. You can read every one of them in <code>src/engine/tensor.js</code>.</p>
 
 <h2>4. Optimizer step</h2>
-<p>After backward, every parameter has a populated <code>.grad</code> array. The optimizer uses these gradients to update the parameters:</p>
+<p>After backward, every parameter has a populated <code>.grad</code> array. The optimizer uses these gradients to update the parameters. NeuralCity ships ten optimizers (see the <strong>Optimizers</strong> reference section for full details):</p>
 <ul>
-  <li><strong>SGD</strong>: <code>W ← W − lr · ∂L/∂W</code>. Simple and predictable. Slower convergence than Adam on most tasks.</li>
-  <li><strong>Adam</strong>: Maintains per-parameter running averages of past gradients (<code>m</code>) and past squared gradients (<code>v</code>), applies bias correction, and computes an adaptive step size per parameter. Converges faster in practice and is significantly more robust to learning rate choice. Adam's momentum and variance state persists between training sessions — it is saved alongside the weights.</li>
+  <li><strong>SGD</strong> — momentum-based gradient descent; simple and predictable baseline.</li>
+  <li><strong>Adam</strong> — adaptive per-parameter learning rates via first and second gradient moments; the standard default for most tasks.</li>
+  <li><strong>AdamW</strong> — Adam with decoupled weight decay; preferred over Adam when regularisation matters.</li>
+  <li><strong>RAdam</strong> — Rectified Adam; warms up the adaptive rate automatically so manual warm-up schedules are unnecessary.</li>
+  <li><strong>Lion</strong> — sign-only update; lower memory than Adam and often faster on large transformers.</li>
+  <li><strong>Adafactor</strong> — factored second-moment estimate; O(r+c) memory instead of O(r·c) for large embedding tables.</li>
+  <li><strong>AdamW 8-bit</strong> — AdamW with block-quantised moment buffers; near-identical convergence at half the memory.</li>
+  <li><strong>LAMB</strong> — Adam with a per-layer trust ratio; designed for very large batch sizes.</li>
+  <li><strong>LARS</strong> — SGD with per-layer local learning rates; standard in distributed image training.</li>
+  <li><strong>Ranger</strong> — RAdam combined with Lookahead; slow weights stabilise training and often improve final quality.</li>
 </ul>
-<p>After the optimizer updates the weights, the gradients are zeroed via <code>zeroGrad()</code> before the next batch begins.</p>
+<p>All optimizer state (moments, slow weights, step counters) is saved alongside the network weights and restored automatically when training resumes. After the optimizer updates the weights, gradients are zeroed via <code>zeroGrad()</code> before the next batch begins.</p>
 
 <h2>5. The training loop</h2>
 <p>NeuralCity's trainer repeats the following for each epoch:</p>
@@ -203,36 +211,128 @@ window.NC_DOCS = [
     title: 'Optimizers',
     body: `
 <h1>Optimizers</h1>
-<p>The optimizer updates the network's weights after each backward pass using the accumulated gradients. NeuralCity provides two optimizers: SGD and Adam.</p>
+<p>The optimizer updates the network's weights after each backward pass using the accumulated gradients. NeuralCity provides ten optimizers. All optimizer state (momentum buffers, variance estimates, slow weights) is saved alongside the model weights so training can resume without a warmup bump.</p>
 
-<h2>SGD (Stochastic Gradient Descent)</h2>
-<p>The simplest optimizer. Each parameter is updated by subtracting a scalar multiple of its gradient:</p>
-<pre><code>W ← W − lr · ∂L/∂W</code></pre>
-<p>SGD is predictable and easy to reason about, but it treats every parameter identically regardless of gradient history. It requires careful learning rate tuning and can be slow to converge in poorly conditioned parameter spaces (where different directions have very different curvatures).</p>
-<p><strong>When to use SGD:</strong> Very small networks where interpretability of training dynamics matters. Also useful when you want to understand the raw gradient descent trajectory without adaptive scaling.</p>
+<h2>SGD — Stochastic Gradient Descent</h2>
+<p>The simplest baseline. Subtracts a scaled gradient from each weight, with optional momentum:</p>
+<pre><code>v ← momentum·v + g
+W ← W − lr·v</code></pre>
+<p>Predictable and interpretable. Requires careful lr tuning. Use when you want to study raw gradient dynamics or as a reference baseline.</p>
 
-<h2>Adam (Adaptive Moment Estimation)</h2>
-<p>Adam maintains two running statistics per parameter and uses them to compute an adaptive learning rate:</p>
-<ul>
-  <li><code>m</code> — first moment estimate (exponential moving average of gradients). Decay rate <code>β₁ = 0.9</code>.</li>
-  <li><code>v</code> — second moment estimate (exponential moving average of squared gradients). Decay rate <code>β₂ = 0.999</code>.</li>
-</ul>
-<p>The update rule (after bias correction) is:</p>
-<pre><code>m̂ = m / (1 − β₁ᵗ)
-v̂ = v / (1 − β₂ᵗ)
+<h2>Adam — Adaptive Moment Estimation</h2>
+<p>Maintains per-parameter first moment <code>m</code> (gradient EMA) and second moment <code>v</code> (squared gradient EMA) with bias correction:</p>
+<pre><code>m̂ = m / (1−β₁ᵗ),  v̂ = v / (1−β₂ᵗ)
 W ← W − lr · m̂ / (√v̂ + ε)</code></pre>
-<p>The denominator <code>√v̂ + ε</code> scales down the step for parameters whose gradients have been large and consistent, and scales up the step for parameters with small or noisy gradients. This is why Adam is robust to learning rate choice and converges fast on most problems.</p>
-<p><strong>Persisted state:</strong> Adam's <code>m</code>, <code>v</code>, and step counter <code>t</code> are saved alongside the model weights. Resuming training after a save continues from the correct optimizer state, not a cold start.</p>
-<p><strong>When to use Adam:</strong> Almost always. Use Adam by default. The only reason to prefer SGD is if you specifically want to study SGD dynamics or are working with a model where Adam's adaptivity is known to cause problems (rare at NeuralCity's scale).</p>
+<p>Robust to lr choice. Good default for most tasks. Weight decay in Adam is coupled to the adaptive rate — use AdamW if you want true L2 decay.</p>
 
-<h2>Hyperparameter guidance</h2>
+<h2>AdamW — Decoupled Weight Decay</h2>
+<p>Identical to Adam but weight decay is applied directly to the weights rather than being mixed into the gradient. This is the correct way to implement L2 regularization with adaptive optimizers:</p>
+<pre><code>W ← (1 − lr·λ)·W − lr · m̂ / (√v̂ + ε)</code></pre>
+<p><strong>Recommended default for language models and any task where you want regularization.</strong> Default <code>weightDecay = 0.01</code>.</p>
+
+<h2>RAdam — Rectified Adam</h2>
+<p>Computes the variance of the adaptive learning rate analytically each step. When the approximated SMA length <code>ρ_t &gt; 5</code> (variance is tractable), applies a rectification factor; otherwise falls back to SGD-with-momentum. This eliminates the bad initial variance that can destabilize Adam in the first few hundred steps:</p>
+<pre><code>ρ_t = ρ_∞ − 2t·β₂ᵗ/(1−β₂ᵗ)
+if ρ_t > 5: W ← W − lr·rect·m̂/(√(v/bc₂)+ε)
+else:       W ← W − lr·m̂</code></pre>
+<p>Good when you find Adam unstable early in training. No warmup schedule needed.</p>
+
+<h2>Ranger — RAdam + Lookahead</h2>
+<p>Combines RAdam (inner optimizer) with Lookahead (outer averaging). Every <code>k=6</code> inner steps, Lookahead interpolates slow weights toward fast weights and resets fast ← slow:</p>
+<pre><code>slow_w += α · (fast_w − slow_w);  fast_w = slow_w</code></pre>
+<p>This smooths the trajectory through the loss landscape, often improving final accuracy. A strong general-purpose choice. Default <code>lookaheadK=6, lookaheadAlpha=0.5</code>.</p>
+
+<h2>Lion — EvoLved Sign Optimizer</h2>
+<p>Uses only the sign of the momentum interpolation — no second moment. Half the optimizer state of Adam:</p>
+<pre><code>c = β₁·m + (1−β₁)·g         # update signal
+W ← (1−lr·λ)·W − lr·sign(c) # weight decay + sign step
+m ← β₂·m + (1−β₂)·g         # update momentum</code></pre>
+<p>Requires a much smaller learning rate than Adam (3–10× smaller, e.g. <code>1e-4</code>). Strong on language tasks. Memory-efficient for large models. Default <code>lr=1e-4, β₁=0.9, β₂=0.99</code>.</p>
+
+<h2>Adafactor — Factored Second Moment</h2>
+<p>For 2D weight matrices, factors the second moment V into row and column statistics instead of storing a full per-element V matrix — O(r+c) memory instead of O(r·c). For bias/1D parameters, uses a standard scalar second moment. Includes gradient clipping via RMS threshold:</p>
+<pre><code>V̂[i,j] ≈ Vr[i]·Vc[j] / mean(Vr)
+u = g / √V̂;  W ← W − (lr/max(1,rms(u)/d))·u</code></pre>
+<p>Ideal for large embedding tables or wide weight matrices where Adam's second moment buffer is a memory bottleneck. Default <code>clipThreshold=1.0</code>.</p>
+
+<h2>AdamW 8-bit</h2>
+<p>Identical update rule to AdamW, but stores the <code>m</code> and <code>v</code> buffers as 8-bit integers with block-wise float32 scales (block size 256). Reduces optimizer state memory ~4× at the cost of slight quantization error in the momentum estimates. Recommended for large charLM models where RAM is a concern.</p>
+
+<h2>LAMB — Layer-wise Adaptive Moments</h2>
+<p>Adam update scaled by a per-parameter trust ratio <code>‖w‖/‖r‖</code>, where <code>r</code> is the Adam update plus L2 term. Keeps the effective step size proportional to the weight norm and is designed for large batch training:</p>
+<pre><code>r = m̂/(√v̂+ε) + λ·w
+trust = ‖w‖/‖r‖  (or 1 if either is 0)
+W ← W − lr·trust·r</code></pre>
+<p>Use when training with very large effective batch sizes (many workers) or when Adam produces inconsistent gradient scales across layers.</p>
+
+<h2>LARS — Layer-wise Adaptive Rate Scaling</h2>
+<p>Extends SGD with momentum by computing a per-parameter local learning rate via a trust ratio. Prevents large gradient norms in some layers from overwhelming small norms in others:</p>
+<pre><code>local_lr = lr·η·‖w‖/(‖g‖ + λ·‖w‖)
+v ← momentum·v + local_lr·(g + λ·w)
+W ← W − v</code></pre>
+<p>Best for convex optimization or when distributing training across many machines with very large batches. Default <code>eta=1e-3</code> (trust coefficient).</p>
+
+<h2>Optimizer state and resuming</h2>
+<p>All optimizer state is saved to disk alongside the model weights. When you click <strong>Continue training</strong>, the optimizer picks up from exactly where it left off — including momentum buffers and step counters. Changing the optimizer type between sessions resets the state (the type mismatch is detected automatically).</p>
+
+<h2>Hyperparameter quick reference</h2>
 <table>
-<tr><th>Hyperparameter</th><th>Default</th><th>Notes</th></tr>
-<tr><td>Learning rate (Adam)</td><td>0.001–0.003</td><td>Adam is tolerant of this range. Start at 0.001. If loss barely moves, try 0.003. If loss oscillates or diverges, drop to 0.0003.</td></tr>
-<tr><td>Learning rate (SGD)</td><td>0.01–0.1</td><td>Much more sensitive than Adam. Requires manual tuning per problem.</td></tr>
-<tr><td>Batch size</td><td>16–64</td><td>Larger batches give smoother gradient estimates but use more memory and may generalize slightly worse. For small datasets (&lt;200 samples), batch size = dataset size (full-batch GD) often works best.</td></tr>
-<tr><td>Epochs</td><td>200–2000</td><td>Watch the loss curve. Stop when loss plateaus for many epochs. More is fine if loss is still decreasing.</td></tr>
+<tr><th>Optimizer</th><th>lr</th><th>Key params</th><th>Best for</th></tr>
+<tr><td>Adam</td><td>1e-3</td><td>β₁=0.9, β₂=0.999</td><td>General default</td></tr>
+<tr><td>AdamW</td><td>1e-3</td><td>weightDecay=0.01</td><td>LM / regularized tasks</td></tr>
+<tr><td>RAdam</td><td>1e-3</td><td>same as Adam</td><td>Unstable early training</td></tr>
+<tr><td>Ranger</td><td>1e-3</td><td>k=6, α=0.5</td><td>Strong general-purpose</td></tr>
+<tr><td>Lion</td><td>1e-4</td><td>β₁=0.9, β₂=0.99</td><td>Memory-efficient LM</td></tr>
+<tr><td>Adafactor</td><td>1e-3</td><td>clipThreshold=1</td><td>Large embeddings</td></tr>
+<tr><td>AdamW 8-bit</td><td>1e-3</td><td>weightDecay=0.01</td><td>RAM-constrained large models</td></tr>
+<tr><td>LAMB</td><td>1e-3</td><td>weightDecay=0.01</td><td>Large effective batch size</td></tr>
+<tr><td>LARS</td><td>0.1</td><td>eta=1e-3, momentum=0.9</td><td>Very large batch / distributed</td></tr>
+<tr><td>SGD</td><td>0.01</td><td>momentum=0.9</td><td>Baseline / interpretability</td></tr>
 </table>
+`
+  },
+  {
+    id: 'tokenizers',
+    title: 'Tokenization',
+    body: `
+<h1>Tokenization for Language Models</h1>
+<p>For Character LM and Chat networks, the tokenizer converts raw text to a sequence of integer IDs before training, and converts IDs back to text during inference. The choice of tokenization strategy directly affects vocab size, context efficiency, and model capacity. Select the tokenizer in the <strong>Editor</strong> tab under Architecture.</p>
+
+<h2>Character — one token per character</h2>
+<p>Every unique Unicode character in the corpus becomes one token. A typical English corpus produces a vocab of 60–120 tokens.</p>
+<ul>
+  <li><strong>Context:</strong> <code>contextLen=32</code> covers 32 characters — about 5–8 words.</li>
+  <li><strong>Pros:</strong> Tiny vocab, no out-of-vocabulary problem, perfect reconstruction.</li>
+  <li><strong>Cons:</strong> The model must learn spelling, word boundaries, and grammar independently. Requires many steps per "semantic unit". Best for very small corpora or when character-level precision matters (e.g. code generation).</li>
+</ul>
+
+<h2>Word-part — BPE subword (default)</h2>
+<p>Byte-Pair Encoding (Sennrich et al., 2016). Starts from a character vocabulary and iteratively merges the most frequent adjacent pair into a new token, up to a target vocabulary size (default: 512). The resulting vocabulary contains common character sequences, syllables, prefixes, and whole words.</p>
+<ul>
+  <li><strong>Context:</strong> <code>contextLen=32</code> covers roughly 32 subword tokens — about 20–30 words depending on the corpus.</li>
+  <li><strong>Pros:</strong> Balances vocab size and context efficiency. Handles rare words gracefully by falling back to sub-character merges. Most LLMs (GPT, BERT, LLaMA) use BPE variants.</li>
+  <li><strong>Cons:</strong> Vocab and merges are corpus-specific — changing the corpus forces a rebuild of the tokenizer and model.</li>
+  <li><strong>Best for:</strong> Most language model tasks. The recommended default.</li>
+</ul>
+
+<h2>Word — one token per whitespace-separated token</h2>
+<p>Splits text on <code>/\S+|\s+/</code> (alternating runs of non-space and space characters). Each unique word and whitespace run is a distinct token.</p>
+<ul>
+  <li><strong>Context:</strong> <code>contextLen=16</code> covers 16 words — a meaningful semantic window for short conversations or sentences.</li>
+  <li><strong>Pros:</strong> Simple, interpretable, efficient context use per word.</li>
+  <li><strong>Cons:</strong> Vocabulary can be very large for diverse corpora; any word not seen at training time is silently dropped at inference. Best for small, controlled vocabulary corpora.</li>
+</ul>
+
+<h2>Changing tokenizer type</h2>
+<p>Changing the tokenizer resets the vocabulary and requires retraining from scratch — the saved weights are invalidated automatically when you save the changed architecture. The old trained model is incompatible because the embedding table rows (one per token ID) no longer correspond to the same tokens.</p>
+
+<h2>Extending vocabulary</h2>
+<p>When you continue training with a corpus that contains tokens not in the saved vocabulary:</p>
+<ul>
+  <li><strong>Character:</strong> New characters are appended to the vocab (existing IDs stay stable). The model is rebuilt to fit the new vocab size — existing weights may lose a few epochs of performance.</li>
+  <li><strong>Word:</strong> New words are appended. Same rebuild behavior.</li>
+  <li><strong>Word-part (BPE):</strong> BPE merges cannot be extended incrementally; the tokenizer is rebuilt from the full new corpus. Model rebuilds from scratch.</li>
+</ul>
 `
   },
   {

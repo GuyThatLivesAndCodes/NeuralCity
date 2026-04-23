@@ -67,7 +67,8 @@ function bindChrome() {
 
 function bindModals() {
   $$('[data-close-modal]').forEach(b => b.addEventListener('click', () => {
-    $('#' + b.dataset.closeModal).hidden = true;
+    const el = $('#' + b.dataset.closeModal);
+    if (el) el.hidden = true;
   }));
   $('#btn-create').addEventListener('click', createNetworkFromModal);
   $('#pass-cancel').addEventListener('click', () => $('#modal-pass').hidden = true);
@@ -200,8 +201,16 @@ function renderNetworksTab(root) {
         <div class="grid-3">
           <label class="field"><span>Optimizer</span>
             <select id="t-optimizer">
-              <option value="adam" ${n.training.optimizer === 'adam' ? 'selected' : ''}>Adam</option>
-              <option value="sgd" ${n.training.optimizer === 'sgd' ? 'selected' : ''}>SGD</option>
+              <option value="adam"      ${n.training.optimizer === 'adam'      ? 'selected' : ''}>Adam</option>
+              <option value="adamw"     ${n.training.optimizer === 'adamw'     ? 'selected' : ''}>AdamW</option>
+              <option value="adamw8bit" ${n.training.optimizer === 'adamw8bit' ? 'selected' : ''}>AdamW 8-bit</option>
+              <option value="radam"     ${n.training.optimizer === 'radam'     ? 'selected' : ''}>RAdam</option>
+              <option value="ranger"    ${n.training.optimizer === 'ranger'    ? 'selected' : ''}>Ranger (RAdam+Lookahead)</option>
+              <option value="lion"      ${n.training.optimizer === 'lion'      ? 'selected' : ''}>Lion</option>
+              <option value="adafactor" ${n.training.optimizer === 'adafactor' ? 'selected' : ''}>Adafactor</option>
+              <option value="lamb"      ${n.training.optimizer === 'lamb'      ? 'selected' : ''}>LAMB</option>
+              <option value="lars"      ${n.training.optimizer === 'lars'      ? 'selected' : ''}>LARS</option>
+              <option value="sgd"       ${n.training.optimizer === 'sgd'       ? 'selected' : ''}>SGD</option>
             </select>
           </label>
           <label class="field"><span>Learning rate</span><input id="t-lr" type="number" step="0.0001" value="${n.training.learningRate}"></label>
@@ -241,6 +250,7 @@ function renderNetworksTab(root) {
         <button class="btn primary" id="btn-save">Save changes</button>
         <button class="btn" id="btn-dup">Duplicate</button>
         <div class="spacer"></div>
+        <button class="btn" id="btn-backup" style="background:#3a3a3a;color:#b5b5b5;">Backup</button>
         <button class="btn danger" id="btn-delete">Delete</button>
       </div>
     </div>
@@ -281,6 +291,8 @@ function renderNetworksTab(root) {
     const dup = await window.nc.networks.duplicate(n.id);
     await refreshNetworks(); selectNetwork(dup.id);
   });
+  $('#btn-backup').addEventListener('click', () => openBackupModal(n.id));
+
   $('#btn-delete').addEventListener('click', () => {
     confirmModal('Delete network?', `This will permanently remove "${n.name}" and its weights.`, async () => {
       await window.nc.networks.delete(n.id);
@@ -454,8 +466,16 @@ function archEditor(a) {
     `;
   }
   if (a.kind === 'charLM') {
+    const tok = a.tokenizerKind || 'char';
     return `
       <div class="grid-3">
+        <label class="field"><span>Tokenizer</span>
+          <select id="a-tok">
+            <option value="wordpart" ${tok === 'wordpart' ? 'selected' : ''}>Word-part (BPE subword)</option>
+            <option value="char"     ${tok === 'char'     ? 'selected' : ''}>Character (char-level)</option>
+            <option value="word"     ${tok === 'word'     ? 'selected' : ''}>Word (word-level)</option>
+          </select>
+        </label>
         <label class="field"><span>Vocab size</span><input id="a-vocab" type="number" readonly value="${a.vocabSize || 0}" title="Auto-inferred from training corpus"></label>
         <label class="field"><span>Embed dim</span><input id="a-embdim" type="number" value="${a.embDim}"></label>
         <label class="field"><span>Context length</span><input id="a-ctx" type="number" value="${a.contextLen}"></label>
@@ -496,6 +516,7 @@ async function saveEditor() {
     a.hidden = $('#a-hidden').value.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0);
     if (a.kind === 'classifier') a.classes = $('#a-classes').value.split(',').map(s => s.trim()).filter(Boolean);
   } else if (a.kind === 'charLM') {
+    a.tokenizerKind = $('#a-tok').value;
     a.embDim = parseInt($('#a-embdim').value);
     a.contextLen = parseInt($('#a-ctx').value);
     a.activation = $('#a-act').value;
@@ -1177,6 +1198,88 @@ function renderDocsTab(root) {
   }));
 }
 
+// ---------- backup modal ----------
+
+async function openBackupModal(netId) {
+  const modal = $('#modal-backup');
+  $('#backup-net-name').textContent = state.current?.name || '';
+  modal.hidden = false;
+  await renderBackupList(netId);
+}
+
+async function renderBackupList(netId) {
+  const body = $('#backup-list-body');
+  if (!body) return;
+  body.innerHTML = '<div style="padding:16px;color:#8a8a8a;">Loading…</div>';
+  let backups;
+  try { backups = await window.nc.backups.list(netId); }
+  catch (e) { body.innerHTML = `<div style="padding:16px;color:#ff7b7b;">Failed to load backups: ${escapeHtml(e.message)}</div>`; return; }
+
+  if (backups.length === 0) {
+    body.innerHTML = `
+      <div class="backup-empty">
+        <div class="big" style="font-size:15px;margin-bottom:8px;">No backups yet</div>
+        <div style="color:#8a8a8a;margin-bottom:16px;">Save a snapshot of this network's weights and settings.</div>
+        <button class="btn primary" id="btn-backup-first">Create your first backup</button>
+      </div>`;
+    $('#btn-backup-first').addEventListener('click', async () => {
+      try { await window.nc.backups.create(netId, ''); await renderBackupList(netId); toast('Backup created.'); }
+      catch (e) { toast('Backup failed: ' + e.message); }
+    });
+    return;
+  }
+
+  body.innerHTML = `
+    <div style="margin-bottom:14px;">
+      <button class="btn primary sm" id="btn-backup-new">+ Create backup</button>
+    </div>
+    <div id="backup-items">
+      ${backups.map(b => `
+        <div class="backup-item" data-id="${b.id}">
+          <div class="backup-info">
+            <div class="backup-label">${escapeHtml(b.label)}</div>
+            <div class="backup-meta">${new Date(b.createdAt).toLocaleString()} · ${b.hasWeights ? 'trained weights' : 'no weights'}</div>
+          </div>
+          <div class="backup-btns">
+            <button class="btn sm" data-act="restore" data-id="${b.id}">Restore</button>
+            <button class="btn sm" data-act="download" data-id="${b.id}">Download</button>
+            <button class="btn sm danger" data-act="delete" data-id="${b.id}">Delete</button>
+          </div>
+        </div>`).join('')}
+    </div>`;
+
+  $('#btn-backup-new').addEventListener('click', async () => {
+    try { await window.nc.backups.create(netId, ''); await renderBackupList(netId); toast('Backup created.'); }
+    catch (e) { toast('Backup failed: ' + e.message); }
+  });
+
+  body.querySelectorAll('[data-act]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const act = btn.dataset.act, backupId = btn.dataset.id;
+      if (act === 'restore') {
+        confirmModal('Restore backup?',
+          'This overwrites the current network state. The current state will be lost unless you have another backup.',
+          async () => {
+            await window.nc.backups.restore(netId, backupId);
+            await refreshNetworks(); await loadCurrent(netId);
+            $('#modal-backup').hidden = true;
+            renderActiveTab(); toast('Network restored from backup.');
+          });
+      } else if (act === 'download') {
+        try {
+          const p = await window.nc.backups.download(netId, backupId);
+          if (p) toast('Saved to ' + p);
+        } catch (e) { toast('Download failed: ' + e.message); }
+      } else if (act === 'delete') {
+        confirmModal('Delete backup?', 'This permanently removes this backup snapshot.', async () => {
+          await window.nc.backups.delete(netId, backupId);
+          await renderBackupList(netId); toast('Backup deleted.');
+        });
+      }
+    });
+  });
+}
+
 // ---------- new network modal ----------
 
 let selectedTemplate = null;
@@ -1243,8 +1346,8 @@ async function createNetworkFromModal() {
 }
 
 function defaultArch(kind) {
-  if (kind === 'chat') return { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 128, hidden: [96, 96], activation: 'gelu', dropout: 0.1, isChat: true };
-  if (kind === 'charLM') return { kind: 'charLM', vocabSize: 0, embDim: 16, contextLen: 16, hidden: [64], activation: 'gelu', dropout: 0 };
+  if (kind === 'chat') return { kind: 'charLM', vocabSize: 0, embDim: 32, contextLen: 64, hidden: [96, 96], activation: 'gelu', dropout: 0.1, isChat: true, tokenizerKind: 'wordpart' };
+  if (kind === 'charLM') return { kind: 'charLM', vocabSize: 0, embDim: 16, contextLen: 32, hidden: [64], activation: 'gelu', dropout: 0, tokenizerKind: 'wordpart' };
   if (kind === 'regressor') return { kind: 'regressor', inputDim: 1, outputDim: 1, hidden: [16], activation: 'tanh', dropout: 0 };
   return { kind: 'classifier', inputDim: 2, outputDim: 2, hidden: [8], activation: 'relu', dropout: 0, classes: ['A', 'B'] };
 }

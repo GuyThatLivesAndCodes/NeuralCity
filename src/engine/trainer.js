@@ -3,7 +3,7 @@
 const T = require('./tensor');
 const { buildFromSpec, restoreFromState, CharLM } = require('./model');
 const { buildOptim } = require('./optim');
-const { CharTokenizer } = require('./tokenizer');
+const { CharTokenizer, buildTokenizer, tokenizerFromJSON } = require('./tokenizer');
 const ChatFormat = require('./chat-format');
 
 // Top-level entry: run one training session for a network config.
@@ -97,7 +97,7 @@ function* _trainCoreGen(network, hooks) {
   let restoredOptim = false;
   if (resumed && network.optimizerState) {
     restoredOptim = optim.loadFromJSON(network.optimizerState);
-    if (restoredOptim) log(`continuing from saved weights (optimizer state restored, ${optim.t || 0} prior steps)`);
+    if (restoredOptim) log(`continuing from saved weights (optimizer state restored, ${optim.t ?? 0} prior steps)`);
     else log('continuing from saved weights (optimizer state mismatched — starting optimizer fresh)');
   } else if (resumed) {
     log('continuing from saved weights (no optimizer state — starting optimizer fresh)');
@@ -232,18 +232,45 @@ function* _trainCoreGen(network, hooks) {
     //      grow to fit the new vocab, and there's no clean way to splice
     //      new rows into the saved weights. We log this so the user knows
     //      why the loss restarts high in this specific case.
+    const tokKind = arch.tokenizerKind || 'char';
     let tokenizer;
     if (network.tokenizer && !fromScratch) {
-      tokenizer = CharTokenizer.fromJSON(network.tokenizer);
-      const known = new Set(tokenizer.chars);
-      const novel = [];
-      for (const ch of text) if (!known.has(ch)) { known.add(ch); novel.push(ch); }
-      if (novel.length > 0) {
-        // Append-only extension keeps existing token IDs stable.
-        const extended = tokenizer.chars.concat(novel);
-        tokenizer = new CharTokenizer(extended);
-        const preview = novel.slice(0, 8).map(c => JSON.stringify(c)).join(', ');
-        log(`vocab expanded by ${novel.length} new char(s) [${preview}${novel.length > 8 ? ', …' : ''}] — rebuilding model from scratch to fit new vocab size`);
+      tokenizer = tokenizerFromJSON(network.tokenizer);
+      let needsRebuild = false;
+      if (tokenizer.kind === 'char') {
+        // Char: append-only extension preserves existing token IDs
+        const known = new Set(tokenizer.chars);
+        const novel = [];
+        for (const ch of text) if (!known.has(ch)) { known.add(ch); novel.push(ch); }
+        if (novel.length > 0) {
+          tokenizer = new CharTokenizer(tokenizer.chars.concat(novel));
+          const preview = novel.slice(0, 8).map(c => JSON.stringify(c)).join(', ');
+          log(`vocab expanded by ${novel.length} new char(s) [${preview}${novel.length > 8 ? ', …' : ''}] — rebuilding model to fit new vocab size`);
+          needsRebuild = true;
+        }
+      } else if (tokenizer.kind === 'word') {
+        // Word: append new unseen words/whitespace tokens
+        const tokens = text.match(/\S+|\s+/g) || [];
+        const known = new Set(tokenizer.words);
+        const novel = [];
+        for (const t of tokens) if (!known.has(t)) { known.add(t); novel.push(t); }
+        if (novel.length > 0) {
+          const { WordTokenizer } = require('./tokenizer');
+          tokenizer = new WordTokenizer(tokenizer.words.concat(novel));
+          log(`word vocab expanded by ${novel.length} new token(s) — rebuilding model`);
+          needsRebuild = true;
+        }
+      } else {
+        // WordPart (BPE): cannot extend merges incrementally — rebuild if new chars appear
+        const knownChars = new Set(Object.keys(tokenizer.vocab).flatMap(t => Array.from(t)));
+        const hasNew = Array.from(new Set(Array.from(text))).some(ch => !knownChars.has(ch));
+        if (hasNew) {
+          tokenizer = buildTokenizer(text, 'wordpart', { vocabSize: 512 });
+          log(`wordpart vocab rebuilt from scratch for new corpus characters`);
+          needsRebuild = true;
+        }
+      }
+      if (needsRebuild) {
         arch.vocabSize = tokenizer.vocabSize;
         model = buildFromSpec(arch, rng);
         const newOpt = buildOptim(optName, model.params, { lr });
@@ -251,7 +278,7 @@ function* _trainCoreGen(network, hooks) {
         resumed = false;
       }
     } else {
-      tokenizer = CharTokenizer.fromCorpus(text);
+      tokenizer = buildTokenizer(text, tokKind, { vocabSize: 512 });
     }
     // First-training-run alignment: when arch.vocabSize was 0 (from a freshly
     // created network), set it to whatever the tokenizer produced and rebuild

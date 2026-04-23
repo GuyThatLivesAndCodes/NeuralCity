@@ -195,6 +195,63 @@ class Storage {
     return net;
   }
 
+  // ── Backup API ─────────────────────────────────────────────────────────────
+
+  _backupDir(netId) {
+    const d = path.join(this.rootDir, 'backups', netId);
+    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+    return d;
+  }
+
+  listBackups(netId) {
+    const d = path.join(this.rootDir, 'backups', netId);
+    if (!fs.existsSync(d)) return [];
+    const out = [];
+    for (const f of fs.readdirSync(d).filter(f => f.endsWith('.json'))) {
+      try {
+        const obj = JSON.parse(fs.readFileSync(path.join(d, f), 'utf-8'));
+        out.push({ id: obj.backupId, label: obj.label || '', createdAt: obj.createdAt, hasWeights: !!obj.network?.state });
+      } catch {}
+    }
+    out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    return out;
+  }
+
+  createBackup(netId, label) {
+    const network = this._readRaw(netId);
+    if (!network) throw new Error('Network not found');
+    const backupId = uuid();
+    const now = Date.now();
+    const backup = {
+      backupId,
+      networkId: netId,
+      label: label || `Backup — ${new Date(now).toLocaleString()}`,
+      createdAt: now,
+      network: { ...network }
+    };
+    fs.writeFileSync(path.join(this._backupDir(netId), `${backupId}.json`), JSON.stringify(backup, null, 2));
+    return { id: backupId, label: backup.label, createdAt: now, hasWeights: !!network.state };
+  }
+
+  deleteBackup(netId, backupId) {
+    const p = path.join(this.rootDir, 'backups', netId, `${backupId}.json`);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+    return true;
+  }
+
+  restoreBackup(netId, backupId) {
+    const p = path.join(this.rootDir, 'backups', netId, `${backupId}.json`);
+    if (!fs.existsSync(p)) throw new Error('Backup not found');
+    const backup = JSON.parse(fs.readFileSync(p, 'utf-8'));
+    const restored = { ...backup.network, id: netId, updatedAt: Date.now() };
+    this._writeRaw(netId, restored);
+    return this.getNetwork(netId);
+  }
+
+  getBackupPath(netId, backupId) {
+    return path.join(this.rootDir, 'backups', netId, `${backupId}.json`);
+  }
+
   // Used by trainer/API server to save back state after training (bypasses patch semantics).
   saveTrainedState(id, { state, optimizerState, tokenizer, metrics, architecture }) {
     const existing = this._readRaw(id);

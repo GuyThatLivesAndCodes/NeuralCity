@@ -32,7 +32,7 @@ const { Worker } = require('worker_threads');
 const T = require('./tensor');
 const { buildFromSpec, restoreFromState, CharLM } = require('./model');
 const { buildOptim } = require('./optim');
-const { CharTokenizer } = require('./tokenizer');
+const { CharTokenizer, buildTokenizer, tokenizerFromJSON } = require('./tokenizer');
 const ChatFormat = require('./chat-format');
 
 // Lay out all model params end-to-end in a single SharedArrayBuffer for the
@@ -141,22 +141,47 @@ async function trainNetworkParallel(network, hooks = {}) {
         : `Training text too short for contextLen=${arch.contextLen}.`);
     }
     arch.isChat = corpus.isChat;
+    const tokKind = arch.tokenizerKind || 'char';
     if (network.tokenizer && !fromScratch) {
-      tokenizer = CharTokenizer.fromJSON(network.tokenizer);
-      const known = new Set(tokenizer.chars);
-      const novel = [];
-      for (const ch of text) if (!known.has(ch)) { known.add(ch); novel.push(ch); }
-      if (novel.length > 0) {
-        const extended = tokenizer.chars.concat(novel);
-        tokenizer = new CharTokenizer(extended);
-        const preview = novel.slice(0, 8).map(c => JSON.stringify(c)).join(', ');
-        log(`vocab expanded by ${novel.length} new char(s) [${preview}${novel.length > 8 ? ', …' : ''}] — rebuilding model`);
+      tokenizer = tokenizerFromJSON(network.tokenizer);
+      let needsRebuild = false;
+      if (tokenizer.kind === 'char') {
+        const known = new Set(tokenizer.chars);
+        const novel = [];
+        for (const ch of text) if (!known.has(ch)) { known.add(ch); novel.push(ch); }
+        if (novel.length > 0) {
+          tokenizer = new CharTokenizer(tokenizer.chars.concat(novel));
+          const preview = novel.slice(0, 8).map(c => JSON.stringify(c)).join(', ');
+          log(`vocab expanded by ${novel.length} new char(s) [${preview}${novel.length > 8 ? ', …' : ''}] — rebuilding model`);
+          needsRebuild = true;
+        }
+      } else if (tokenizer.kind === 'word') {
+        const tokens = text.match(/\S+|\s+/g) || [];
+        const known = new Set(tokenizer.words);
+        const novel = [];
+        for (const t of tokens) if (!known.has(t)) { known.add(t); novel.push(t); }
+        if (novel.length > 0) {
+          const { WordTokenizer } = require('./tokenizer');
+          tokenizer = new WordTokenizer(tokenizer.words.concat(novel));
+          log(`word vocab expanded by ${novel.length} new token(s) — rebuilding model`);
+          needsRebuild = true;
+        }
+      } else {
+        const knownChars = new Set(Object.keys(tokenizer.vocab).flatMap(t => Array.from(t)));
+        const hasNew = Array.from(new Set(Array.from(text))).some(ch => !knownChars.has(ch));
+        if (hasNew) {
+          tokenizer = buildTokenizer(text, 'wordpart', { vocabSize: 512 });
+          log(`wordpart vocab rebuilt from scratch for new corpus characters`);
+          needsRebuild = true;
+        }
+      }
+      if (needsRebuild) {
         arch.vocabSize = tokenizer.vocabSize;
         model = buildFromSpec(arch, rng);
         resumed = false;
       }
     } else {
-      tokenizer = CharTokenizer.fromCorpus(text);
+      tokenizer = buildTokenizer(text, tokKind, { vocabSize: 512 });
     }
     if (!resumed && tokenizer.vocabSize !== arch.vocabSize) {
       arch.vocabSize = tokenizer.vocabSize;
@@ -179,7 +204,7 @@ async function trainNetworkParallel(network, hooks = {}) {
   const optim = buildOptim(optName, model.params, { lr });
   if (resumed && network.optimizerState) {
     const ok = optim.loadFromJSON(network.optimizerState);
-    if (ok) log(`continuing from saved weights (optimizer state restored, ${optim.t || 0} prior steps)`);
+    if (ok) log(`continuing from saved weights (optimizer state restored, ${optim.t ?? 0} prior steps)`);
     else log('continuing from saved weights (optimizer state mismatched — starting optimizer fresh)');
   } else if (resumed) {
     log('continuing from saved weights (no optimizer state — starting optimizer fresh)');

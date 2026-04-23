@@ -112,6 +112,25 @@ ipcMain.handle('networks:import', async () => {
   return storage.importNetwork(data);
 });
 
+ipcMain.handle('backups:list',    (_, netId)           => storage.listBackups(netId));
+ipcMain.handle('backups:create',  (_, netId, label)    => storage.createBackup(netId, label));
+ipcMain.handle('backups:delete',  (_, netId, backupId) => storage.deleteBackup(netId, backupId));
+ipcMain.handle('backups:restore', (_, netId, backupId) => storage.restoreBackup(netId, backupId));
+ipcMain.handle('backups:download', async (_, netId, backupId) => {
+  const srcPath = storage.getBackupPath(netId, backupId);
+  if (!fs.existsSync(srcPath)) throw new Error('Backup not found');
+  const backup = JSON.parse(fs.readFileSync(srcPath, 'utf-8'));
+  const safeName = (backup.label || 'backup').replace(/[^a-z0-9_\-]/gi, '_').slice(0, 48);
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: 'Save Backup',
+    defaultPath: `${safeName}.ncbackup.json`,
+    filters: [{ name: 'NeuralCity Backup', extensions: ['json'] }]
+  });
+  if (result.canceled || !result.filePath) return null;
+  fs.copyFileSync(srcPath, result.filePath);
+  return result.filePath;
+});
+
 ipcMain.handle('training:start', (_, id, opts) => trainer.start(id, opts));
 ipcMain.handle('training:stop', (_, id) => trainer.stop(id));
 ipcMain.handle('training:status', (_, id) => trainer.status(id));
