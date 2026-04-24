@@ -32,7 +32,7 @@ const { Worker } = require('worker_threads');
 const T = require('./tensor');
 const { buildFromSpec, restoreFromState, CharLM } = require('./model');
 const { buildOptim } = require('./optim');
-const { CharTokenizer, buildTokenizer, tokenizerFromJSON } = require('./tokenizer');
+const { CharTokenizer, WordPartTokenizer, buildTokenizer, tokenizerFromJSON } = require('./tokenizer');
 const ChatFormat = require('./chat-format');
 
 // Lay out all model params end-to-end in a single SharedArrayBuffer for the
@@ -181,13 +181,23 @@ async function trainNetworkParallel(network, hooks = {}) {
         resumed = false;
       }
     } else {
-      tokenizer = buildTokenizer(text, tokKind, { vocabSize: 512 });
+      // trainNetworkParallel is already async so we can await the BPE build
+      // directly — no separate pre-build step needed.
+      const _yield = () => new Promise(r => setImmediate(r));
+      if (tokKind === 'wordpart') {
+        tokenizer = await WordPartTokenizer.fromCorpusAsync(text, 512, _yield);
+      } else {
+        tokenizer = buildTokenizer(text, tokKind, { vocabSize: 512 });
+      }
     }
     if (!resumed && tokenizer.vocabSize !== arch.vocabSize) {
       arch.vocabSize = tokenizer.vocabSize;
       model = buildFromSpec(arch, rng);
     }
-    ids = tokenizer.encode(text);
+    const _yieldFn = () => new Promise(r => setImmediate(r));
+    ids = tokenizer.kind === 'wordpart'
+      ? await tokenizer.encodeAsync(text, _yieldFn)
+      : tokenizer.encode(text);
     L = arch.contextLen;
     N = ids.length - L;
     if (N <= 0) throw new Error('not enough tokens');

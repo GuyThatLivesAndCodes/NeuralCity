@@ -69,16 +69,12 @@ class WordPartTokenizer {
     // vocab:  plain object  token → id  (not a Map, for easy JSON round-trip)
     this.merges = merges;
     this.vocab  = vocab;
+    this._vocabSize = Object.keys(vocab).length;
     this.ivocab = Object.create(null);
     for (const [tok, id] of Object.entries(vocab)) this.ivocab[id] = tok;
-    // Fast merge lookup: "a\x01b" → merge priority index
-    this._mergeIdx = new Map();
-    for (let i = 0; i < merges.length; i++) {
-      this._mergeIdx.set(merges[i][0] + SEP + merges[i][1], i);
-    }
   }
 
-  get vocabSize() { return Object.keys(this.vocab).length; }
+  get vocabSize() { return this._vocabSize; }
   get kind() { return 'wordpart'; }
 
   // Map-like interface so trainer.js pad-char logic works the same as for
@@ -88,18 +84,53 @@ class WordPartTokenizer {
     return { has: (k) => Object.prototype.hasOwnProperty.call(v, k), get: (k) => v[k] };
   }
 
+  // Apply BPE merge rules in priority order (rule 0 = highest priority).
+  // Each rule is applied in one O(n) pass over the token sequence — this is
+  // O(n × V) overall, not O(n²) — critical for large-corpus encoding.
+  // Produces the same result as greedy best-first because BPE rule ordering
+  // guarantees that rule i is always preferred over rule i+1.
   _applyMerges(chars) {
     let tokens = chars.slice();
-    while (tokens.length > 1) {
-      let bestPri = Infinity, bestPos = -1;
-      for (let i = 0; i < tokens.length - 1; i++) {
-        const pri = this._mergeIdx.get(tokens[i] + SEP + tokens[i + 1]);
-        if (pri !== undefined && pri < bestPri) { bestPri = pri; bestPos = i; }
+    for (const [a, b] of this.merges) {
+      if (tokens.length < 2) break;
+      const next = [];
+      let i = 0;
+      while (i < tokens.length) {
+        if (i + 1 < tokens.length && tokens[i] === a && tokens[i + 1] === b) {
+          next.push(a + b); i += 2;
+        } else {
+          next.push(tokens[i]); i++;
+        }
       }
-      if (bestPos === -1) break;
-      tokens.splice(bestPos, 2, tokens[bestPos] + tokens[bestPos + 1]);
+      tokens = next;
     }
     return tokens;
+  }
+
+  // Async version: yields to the event loop every 32 merge rules so that IPC
+  // and UI events are not starved during large-corpus encoding.
+  async encodeAsync(text, yieldFn) {
+    let tokens = Array.from(text);
+    for (let ri = 0; ri < this.merges.length; ri++) {
+      if (tokens.length < 2) break;
+      const [a, b] = this.merges[ri];
+      const next = [];
+      let i = 0;
+      while (i < tokens.length) {
+        if (i + 1 < tokens.length && tokens[i] === a && tokens[i + 1] === b) {
+          next.push(a + b); i += 2;
+        } else {
+          next.push(tokens[i]); i++;
+        }
+      }
+      tokens = next;
+      if (ri % 32 === 31 && yieldFn) await yieldFn();
+    }
+    return tokens.map(t => {
+      const id = this.vocab[t];
+      if (id == null) throw new Error(`token not in vocab: ${JSON.stringify(t)}`);
+      return id;
+    });
   }
 
   encode(text) {
@@ -124,38 +155,58 @@ class WordPartTokenizer {
 
   decode(ids) { return ids.map(id => this.ivocab[id] || '').join(''); }
 
-  // Build a WordPartTokenizer from a corpus using byte-pair encoding.
-  // targetVocabSize: desired final vocabulary size (char vocab + merges).
   static fromCorpus(text, targetVocabSize = 512) {
+    // Drain the generator synchronously.
+    const gen = WordPartTokenizer._buildBPEGen(text, targetVocabSize);
+    let step;
+    do { step = gen.next(); } while (!step.done);
+    return step.value;
+  }
+
+  // Async version: yields to the event loop every 20 merge iterations so IPC
+  // and UI events are not starved when building from a large corpus.
+  static async fromCorpusAsync(text, targetVocabSize = 512, yieldFn) {
+    const gen = WordPartTokenizer._buildBPEGen(text, targetVocabSize);
+    let step;
+    do {
+      step = gen.next();
+      if (!step.done && yieldFn) await yieldFn();
+    } while (!step.done);
+    return step.value;
+  }
+
+  // Generator that performs BPE training and yields every 20 merge steps.
+  // The return value (when done === true) is the completed WordPartTokenizer.
+  static *_buildBPEGen(text, targetVocabSize = 512) {
     const chars = Array.from(new Set(Array.from(text))).sort();
     const vocab = Object.create(null);
     let nextId = 0;
     for (const ch of chars) vocab[ch] = nextId++;
 
     const merges = [];
-    let tokenSeq = Array.from(text); // string[] — one char per element initially
+    let tokenSeq = Array.from(text);
+    let vocabCount = chars.length;
+    let itr = 0;
 
-    while (Object.keys(vocab).length < targetVocabSize) {
+    while (vocabCount < targetVocabSize) {
       if (tokenSeq.length < 2) break;
-      // Count adjacent pairs
       const counts = new Map();
       for (let i = 0; i < tokenSeq.length - 1; i++) {
         const k = tokenSeq[i] + SEP + tokenSeq[i + 1];
         counts.set(k, (counts.get(k) || 0) + 1);
       }
       if (!counts.size) break;
-      // Find most frequent pair (ties broken by first-seen)
       let bestKey = null, bestCount = 0;
       for (const [k, c] of counts) { if (c > bestCount) { bestCount = c; bestKey = k; } }
-      if (!bestKey || bestCount < 2) break; // no pair worth merging
+      if (!bestKey || bestCount < 2) break;
 
       const si = bestKey.indexOf(SEP);
       const a = bestKey.slice(0, si), b = bestKey.slice(si + 1);
       const merged = a + b;
       vocab[merged] = nextId++;
+      vocabCount++;
       merges.push([a, b]);
 
-      // Apply the merge throughout the sequence
       const newSeq = [];
       let i = 0;
       while (i < tokenSeq.length) {
@@ -164,6 +215,7 @@ class WordPartTokenizer {
         } else { newSeq.push(tokenSeq[i]); i++; }
       }
       tokenSeq = newSeq;
+      if (++itr % 20 === 0) yield;
     }
 
     return new WordPartTokenizer(merges, vocab);

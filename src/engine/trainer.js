@@ -3,7 +3,7 @@
 const T = require('./tensor');
 const { buildFromSpec, restoreFromState, CharLM } = require('./model');
 const { buildOptim } = require('./optim');
-const { CharTokenizer, buildTokenizer, tokenizerFromJSON } = require('./tokenizer');
+const { CharTokenizer, WordPartTokenizer, buildTokenizer, tokenizerFromJSON } = require('./tokenizer');
 const ChatFormat = require('./chat-format');
 
 // Top-level entry: run one training session for a network config.
@@ -27,18 +27,47 @@ async function trainNetwork(network, hooks = {}) {
       if (hooks.log) hooks.log(`worker pool failed (${e.message}); falling back to single-thread training`);
     }
   }
-  // Single-thread path. Yields occasionally so the UI thread stays responsive
-  // and the user can still hit "Stop training" — but only every ~50ms of work,
-  // not every step, since each yield costs ~0.5-1ms of event-loop overhead.
-  const gen = _trainCoreGen(network, hooks);
+  // Single-thread path.
+  //
+  // For charLM networks using word-part (BPE) tokenization, building the
+  // tokenizer and encoding the corpus are O(V × n) and block the main-process
+  // event loop. We run them asynchronously here, before the sync generator,
+  // so IPC, stop-signals, and progress events can fire between phases.
+  const yieldFn = () => new Promise(r => setImmediate(r));
+  let prebuilt = null;
+  const _arch = network.architecture;
+  if (_arch?.kind === 'charLM') {
+    const tokKind = _arch.tokenizerKind || 'char';
+    if (tokKind === 'wordpart') {
+      const corpus = ChatFormat.buildCorpus(network.trainingData || {});
+      const minLen = (_arch.contextLen || 32) + 2;
+      if (corpus.text.length >= minLen) {
+        await yieldFn();
+        if (!network.tokenizer || hooks.fromScratch) {
+          const tok = await WordPartTokenizer.fromCorpusAsync(corpus.text, 512, yieldFn);
+          await yieldFn();
+          const ids = await tok.encodeAsync(corpus.text, yieldFn);
+          await yieldFn();
+          prebuilt = { tokenizer: tok, ids };
+        } else {
+          // Continuation: tokenizer already stored; just encode the corpus async.
+          const tok = tokenizerFromJSON(network.tokenizer);
+          if (tok.kind === 'wordpart') {
+            const ids = await tok.encodeAsync(corpus.text, yieldFn);
+            await yieldFn();
+            prebuilt = { tokenizer: tok, ids };
+          }
+        }
+      }
+    }
+  }
+
+  const gen = _trainCoreGen(network, hooks, prebuilt);
   let result;
   let lastYield = Date.now();
   while (true) {
     const step = gen.next();
     if (step.done) { result = step.value; break; }
-    // Yield only when enough wall time has passed. The generator yields at
-    // its progress checkpoints, but we batch them into a single setImmediate
-    // round-trip when they fire close together.
     const now = Date.now();
     if (now - lastYield >= 16) {
       await new Promise(r => setImmediate(r));
@@ -56,7 +85,7 @@ function trainNetworkSync(network, hooks = {}) {
   return step.value;
 }
 
-function* _trainCoreGen(network, hooks) {
+function* _trainCoreGen(network, hooks, prebuilt = null) {
   const onProgress = hooks.onProgress || (() => {});
   const shouldStop = hooks.shouldStop || (() => false);
   const log = hooks.log || (() => {});
@@ -234,7 +263,20 @@ function* _trainCoreGen(network, hooks) {
     //      why the loss restarts high in this specific case.
     const tokKind = arch.tokenizerKind || 'char';
     let tokenizer;
-    if (network.tokenizer && !fromScratch) {
+    // If trainNetwork pre-built the tokenizer asynchronously, use it directly
+    // and skip the (potentially blocking) build/restore logic here.
+    if (prebuilt && prebuilt.tokenizer) {
+      tokenizer = prebuilt.tokenizer;
+      // A prebuilt tokenizer from trainNetwork means we already handled the
+      // continuation vs fresh-build decision there. If it's a fresh build the
+      // vocab may differ from arch — realign and rebuild model.
+      if (!resumed && tokenizer.vocabSize !== arch.vocabSize) {
+        arch.vocabSize = tokenizer.vocabSize;
+        model = buildFromSpec(arch, rng);
+        const newOpt = buildOptim(optName, model.params, { lr });
+        Object.assign(optim, newOpt);
+      }
+    } else if (network.tokenizer && !fromScratch) {
       tokenizer = tokenizerFromJSON(network.tokenizer);
       let needsRebuild = false;
       if (tokenizer.kind === 'char') {
@@ -280,21 +322,14 @@ function* _trainCoreGen(network, hooks) {
     } else {
       tokenizer = buildTokenizer(text, tokKind, { vocabSize: 512 });
     }
-    // First-training-run alignment: when arch.vocabSize was 0 (from a freshly
-    // created network), set it to whatever the tokenizer produced and rebuild
-    // the model now that we know the real vocab size. We only do this when
-    // NOT resumed — on a resume path, `model` was built from the saved state
-    // which already matches `tokenizer.vocabSize` (we aligned arch above).
-    // Wiping the model on resume here was the source of the "Continue training
-    // loss spiked back to fresh-init levels" bug.
-    if (!resumed && tokenizer.vocabSize !== arch.vocabSize) {
+    if (!prebuilt && !resumed && tokenizer.vocabSize !== arch.vocabSize) {
       arch.vocabSize = tokenizer.vocabSize;
       model = buildFromSpec(arch, rng);
       const newOpt = buildOptim(optName, model.params, { lr });
       Object.assign(optim, newOpt);
     }
 
-    const ids = tokenizer.encode(text);
+    const ids = prebuilt?.ids || tokenizer.encode(text);
     const L = arch.contextLen;
     const N = ids.length - L;
     if (N <= 0) throw new Error('not enough tokens');
@@ -375,7 +410,7 @@ function infer(network, input) {
 
   if (arch.kind === 'charLM') {
     if (!network.tokenizer) throw new Error('tokenizer missing');
-    const tokenizer = CharTokenizer.fromJSON(network.tokenizer);
+    const tokenizer = tokenizerFromJSON(network.tokenizer);
     const maxNew = input.maxTokens ?? 120;
     const temperature = input.temperature ?? 1.0;
     const topK = input.topK ?? 0;
