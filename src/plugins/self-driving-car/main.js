@@ -23,8 +23,8 @@ const MAX_FRAMES  = (50 * 18);  // Increased to 25s to allow for realistic accel
 // ── Sensory Array (15 Rays) ──────────────────────────────────────────────────
 // Generates 15 rays spanning 160 degrees (-80 to +80) for better peripheral vision
 const RAY_ANGLES  = Array.from({length: 18}, (_, i) => -1.4 + (i * 2.8 / 14));
-const RAY_MAX     = 60;  // Longer range for high-speed reaction
-const RAY_STEP    = 20;    // Smaller step for higher precision detection
+const RAY_MAX     = 70;  // Longer range for high-speed reaction
+const RAY_STEP    = 2;    // Smaller step for higher precision detection
 
 // ── Realistic Physics & Movement ─────────────────────────────────────────────
 const DT          = 1 / 50; // 50fps suggested for smooth but realistic physics integration
@@ -209,7 +209,8 @@ function carFitness(car) {
   // Primary: distance traveled. Tie-break: avg speed.
   const progress   = car.laps + car.totalDist / Math.max(1, car.frames) * (car.frames / _track.N);
   const speedBonus = (car.frames > 0 ? car.speed / MAX_SPEED : 0) * 0.01;
-  return progress + speedBonus;
+  const deathPenalty = car.alive ? 1 : 0.8; // Small penalty for dying to encourage survival
+  return (progress + speedBonus) * deathPenalty;
 }
 
 // ── Neural net inference ──────────────────────────────────────────────────────
