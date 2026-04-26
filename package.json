@@ -1,6 +1,6 @@
 {
   "name": "neuralcity",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "Build neural networks from the ground up. No frameworks, no fluff.",
   "main": "src/main/main.js",
   "author": "NeuralCity",
