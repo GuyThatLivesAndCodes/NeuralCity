@@ -832,6 +832,22 @@ function renderTrainTab(root) {
     return;
   }
   const n = state.current;
+  // Plugin-managed networks handle training inside their own simulation (Infer tab).
+  if (n.architecture?.pluginKind && pluginRegistry.inferenceRenderers[n.architecture.pluginKind]) {
+    root.innerHTML = `
+      <div class="panel">
+        <h2>Plugin network — ${escapeHtml(n.name)}</h2>
+        <div style="background:#1a1a0d;border:1px solid #3a3a1a;border-radius:6px;padding:14px 18px;max-width:520px;">
+          <div style="font-weight:600;margin-bottom:6px;color:#ffd600;">Training runs inside the simulation</div>
+          <div style="font-size:12px;color:#aaa;line-height:1.6;">
+            This network is managed by the <strong style="color:#ccc;">${escapeHtml(n.architecture.pluginKind)}</strong> plugin,
+            which trains through environment interaction rather than labelled data.
+            Switch to the <strong style="color:#ccc;">Infer</strong> tab to start and watch the simulation.
+          </div>
+        </div>
+      </div>`;
+    return;
+  }
   const hasWeights = !!n.state || n.stateLocked;
   const primaryLabel = hasWeights ? 'Continue training' : 'Start training';
   const hint = hasWeights

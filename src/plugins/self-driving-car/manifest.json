@@ -1,0 +1,7 @@
+{
+  "id": "self-driving-car",
+  "name": "Self-Driving Car",
+  "version": "1.0.0",
+  "description": "Selective Reproduction (Neuroevolution) demo: a population of cars evolves to lap an auto-generated track as fast as possible. No training data needed.",
+  "author": "NeuralCabin"
+}
