@@ -1,8 +1,16 @@
 'use strict';
 
+const path = require('path');
+const { Worker } = require('worker_threads');
 const { EventEmitter } = require('events');
-const { trainNetwork, infer, inferStream, buildInferenceCache } = require('../engine/trainer');
+const { infer, inferStream, buildInferenceCache } = require('../engine/trainer');
 const { runScript } = require('../dsl/interpreter');
+
+const WORKER_PATH = path.join(__dirname, '..', 'engine', 'training-session-worker.js');
+// After a cooperative stop request, wait this long before force-terminating the
+// worker. Keeps "Stop" responsive without sacrificing the partial-state save in
+// the common case where the worker finishes its current batch quickly.
+const FORCE_TERMINATE_DELAY_MS = 5000;
 
 // ── Structured log helper ─────────────────────────────────────────────────────
 
@@ -32,7 +40,7 @@ class TrainingManager extends EventEmitter {
   constructor(storage) {
     super();
     this.storage = storage;
-    this.active = new Map();     // id -> { stop, startedAt, lastProgress }
+    this.active = new Map();      // id -> { worker, forceTimer, startedAt, lastProgress }
     this._modelCache = new Map(); // id -> { updatedAt, cache }
   }
 
@@ -76,50 +84,78 @@ class TrainingManager extends EventEmitter {
       net = { ...net, training: { ...net.training, ...opts.overrides } };
     }
 
-    let cancelRequested = false;
+    const log = makeLog(this.emit.bind(this), id);
+    const backend = getBackendMeta();
+    log(`training started (backend=${backend.mode}${backend.reason ? '/' + backend.reason : ''})`);
+
+    const worker = new Worker(WORKER_PATH, { workerData: { network: net, fromScratch } });
+
     const record = {
-      stop: () => { cancelRequested = true; },
+      worker,
+      forceTimer: null,
       startedAt: Date.now(),
       lastProgress: null,
     };
     this.active.set(id, record);
 
-    const log = makeLog(this.emit.bind(this), id);
-    const backend = getBackendMeta();
-    log(`training started (backend=${backend.mode}${backend.reason ? '/' + backend.reason : ''})`);
+    const cleanup = () => {
+      if (record.forceTimer) { clearTimeout(record.forceTimer); record.forceTimer = null; }
+      this.active.delete(id);
+    };
 
-    (async () => {
-      const t0 = Date.now();
-      try {
-        const result = await trainNetwork(net, {
-          fromScratch,
-          onProgress: (p) => {
-            record.lastProgress = p;
-            this.emit('progress', { id, ...p });
-          },
-          shouldStop: () => cancelRequested,
-          log: (line) => log(line),
-        });
+    worker.on('message', (msg) => {
+      switch (msg.type) {
+        case 'progress':
+          record.lastProgress = msg;
+          this.emit('progress', { id, epoch: msg.epoch, totalEpochs: msg.totalEpochs,
+            step: msg.step, totalSteps: msg.totalSteps, loss: msg.loss, elapsedMs: msg.elapsedMs });
+          break;
 
-        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-        log(`training finished in ${elapsed}s (${result.metrics?.length ?? 0} epochs)`);
+        case 'log':
+          this.emit('log', { id, line: msg.line, level: msg.level || 'info', ts: Date.now() });
+          break;
 
-        this.storage.saveTrainedState(id, {
-          state: result.state,
-          optimizerState: result.optimizerState,
-          tokenizer: result.tokenizer,
-          architecture: result.architecture,
-          metrics: result.metrics,
-        });
-        this._modelCache.delete(id);
-        this.emit('done', { id, stopped: !!result.stopped, metrics: result.metrics });
-      } catch (e) {
-        log(`training error: ${e.message}`, 'error');
-        this.emit('error', { id, message: e.message, stack: e.stack });
-      } finally {
-        this.active.delete(id);
+        case 'done': {
+          const result = msg.result;
+          const elapsed = ((Date.now() - record.startedAt) / 1000).toFixed(1);
+          log(`training finished in ${elapsed}s (${result.metrics?.length ?? 0} epochs)`);
+          this.storage.saveTrainedState(id, {
+            state: result.state,
+            optimizerState: result.optimizerState,
+            tokenizer: result.tokenizer,
+            architecture: result.architecture,
+            metrics: result.metrics,
+          });
+          this._modelCache.delete(id);
+          this.emit('done', { id, stopped: !!result.stopped, metrics: result.metrics });
+          cleanup();
+          break;
+        }
+
+        case 'error':
+          log(`training error: ${msg.message}`, 'error');
+          this.emit('error', { id, message: msg.message, stack: msg.stack });
+          cleanup();
+          break;
       }
-    })();
+    });
+
+    worker.on('error', (e) => {
+      log(`worker error: ${e.message}`, 'error');
+      this.emit('error', { id, message: e.message, stack: e.stack });
+      cleanup();
+    });
+
+    // Fires when the worker exits for any reason — including worker.terminate().
+    // If cleanup() has already run (normal done/error path) this is a no-op.
+    worker.on('exit', () => {
+      if (!this.active.has(id)) return;
+      log('training stopped (worker terminated)', 'warn');
+      this.emit('done', { id, stopped: true, metrics: record.lastProgress
+        ? [{ epoch: record.lastProgress.epoch, loss: record.lastProgress.loss }]
+        : [] });
+      cleanup();
+    });
 
     return { started: true, fromScratch };
   }
@@ -127,8 +163,21 @@ class TrainingManager extends EventEmitter {
   stop(id) {
     const a = this.active.get(id);
     if (!a) return { running: false };
-    a.stop();
+
+    // Cooperative stop: worker's shouldStop() returns true on the next check.
+    // The worker finishes its current batch, saves partial state, then posts 'done'.
+    a.worker.postMessage({ type: 'stop' });
     makeLog(this.emit.bind(this), id)('stop requested');
+
+    // Safety net: if the worker hasn't responded within the timeout, kill it.
+    // This handles hangs and pathologically slow single batches.
+    a.forceTimer = setTimeout(() => {
+      if (this.active.has(id)) {
+        makeLog(this.emit.bind(this), id)('force-terminating worker after timeout', 'warn');
+        a.worker.terminate();
+      }
+    }, FORCE_TERMINATE_DELAY_MS);
+
     return { stopping: true };
   }
 
