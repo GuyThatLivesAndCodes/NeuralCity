@@ -794,9 +794,7 @@ async function saveEditor() {
     // Plugin manages its own trainingData — don't overwrite on save
   } else if (a.kind === 'gpt') {
     const ed = state.gptEditor;
-    patch.trainingData = ed.modality === 'sft'
-      ? { modality: 'sft', samples: ed.pairs }
-      : { modality: 'corpus', documents: ed.docs };
+    patch.trainingData = { modality: ed.modality, documents: ed.docs, samples: ed.pairs };
   } else {
     let data;
     try { data = JSON.parse($('#data-json').value); }
