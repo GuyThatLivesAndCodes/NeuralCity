@@ -26,7 +26,8 @@ class PluginLoader {
   }
 
   // Load all installed plugins and register their main-process IPC handlers.
-  load(ipcMain) {
+  // storage is optional; passed to factory-style plugins (those that export a function).
+  load(ipcMain, storage) {
     if (!fs.existsSync(this.pluginDir)) {
       fs.mkdirSync(this.pluginDir, { recursive: true });
       return;
@@ -48,7 +49,9 @@ class PluginLoader {
         if (fs.existsSync(mainPath)) {
           // Clear require cache so reinstalled plugins reload cleanly.
           delete require.cache[require.resolve(mainPath)];
-          const pluginMain = require(mainPath);
+          let pluginMain = require(mainPath);
+          // Factory pattern: if the plugin exports a function, call it with context.
+          if (typeof pluginMain === 'function') pluginMain = pluginMain({ storage });
           if (pluginMain && pluginMain.mainHandlers) {
             for (const [channel, handler] of Object.entries(pluginMain.mainHandlers)) {
               ipcMain.handle(`plugin:${id}:${channel}`, handler);

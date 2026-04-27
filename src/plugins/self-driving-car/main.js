@@ -35,6 +35,12 @@ const GRIP_LOSS   = 0.4;    // Speed lost during hard cornering (proportional to
 const CANVAS_CX   = 350;
 const CANVAS_CY   = 285;
 
+const ARCH = {
+  kind: 'classifier',
+  inputDim: INPUT_DIM, outputDim: OUTPUT_DIM,
+  hidden: [64, 32, 16], activation: 'tanh', dropout: 0,
+};
+
 // ── Per-instance sessions ─────────────────────────────────────────────────────
 function makeSession() {
   return {
@@ -299,156 +305,240 @@ function buildVisualState(s) {
   };
 }
 
-// ── IPC handlers ──────────────────────────────────────────────────────────────
-module.exports = {
-  mainHandlers: {
-    'self-driving-car:init': (_, opts = {}) => {
-      if (!Population || !T) return { error: 'Neuroevolution engine unavailable.' };
-      const id = opts.instanceId || 'default';
-      const s  = getSession(id);
+// ── Storage helpers ───────────────────────────────────────────────────────────
 
-      s.popSize = Math.max(4, Math.min(100, (opts.popSize | 0) || DEFAULT_POP_SIZE));
-      s.maxGens = Math.max(0, (opts.generations | 0) || 0);
-      const seed   = (opts.seed || 0) >>> 0;
-      const mutStd = Math.max(0.001, opts.mutStd || 0.05);
+function savePopToStorage(storage, id, s) {
+  if (!storage || !s.pop) return;
+  try {
+    storage.saveTrainedState(id, { state: s.pop.toJSON(), architecture: ARCH });
+  } catch (e) {
+    console.warn('[self-driving-car] Could not save state:', e.message);
+  }
+}
 
-      s.track = generateTrack(seed || 0xC0FFEE);
+function loadPopFromStorage(storage, id) {
+  if (!storage) return null;
+  try {
+    const net = storage.getNetwork(id);
+    if (!net || !net.state || net.stateLocked) return null;
+    const pop = Population.fromJSON(net.state);
+    // fromJSON doesn't restore bestIndividual pointer; elites land at index 0.
+    if (!pop.bestIndividual && pop.individuals.length > 0) {
+      pop.bestIndividual = pop.individuals[0];
+    }
+    return pop;
+  } catch (e) {
+    console.warn('[self-driving-car] Could not load state:', e.message);
+    return null;
+  }
+}
 
-      s.pop = new Population({
-        architecture: {
-          kind: 'classifier',
-          inputDim: INPUT_DIM, outputDim: OUTPUT_DIM,
-          hidden: [64, 32, 16], activation: 'tanh', dropout: 0,
-        },
-        size: s.popSize,
-        eliteCount: Math.max(1, Math.floor(s.popSize * 0.2)),
-        pMutate: 0.15, mutationStd: mutStd,
-        tournamentK: 3, seed: opts.seed || 42,
-      });
+// ── IPC handlers (factory — receives storage from plugin-loader) ──────────────
+module.exports = function ({ storage } = {}) {
+  return {
+    mainHandlers: {
+      'self-driving-car:init': (_, opts = {}) => {
+        if (!Population || !T) return { error: 'Neuroevolution engine unavailable.' };
+        const id = opts.instanceId || 'default';
+        const s  = getSession(id);
 
-      s.cars       = Array.from({ length: s.popSize }, () => spawnCar(s.track));
-      s.carFit     = new Array(s.popSize).fill(0);
-      s.generation = 0;
-      s.bestFit    = 0;
-      s.genBestFit = 0;
-      s.running    = true;
-      s.genHistory = [];
+        s.popSize = Math.max(4, Math.min(100, (opts.popSize | 0) || DEFAULT_POP_SIZE));
+        s.maxGens = Math.max(0, (opts.generations | 0) || 0);
+        const seed   = (opts.seed || 0) >>> 0;
+        const mutStd = Math.max(0.001, opts.mutStd || 0.05);
 
-      return { ok: true, track: s.track };
-    },
+        s.track = generateTrack(seed || 0xC0FFEE);
 
-    'self-driving-car:getState': (_, opts = {}) => {
-      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
-      return buildVisualState(getSession(id));
-    },
-
-    'self-driving-car:step': (_, opts = {}) => {
-      const id = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
-      return stepGeneration(getSession(id), opts);
-    },
-
-    'self-driving-car:start': (_, opts = {}) => {
-      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
-      getSession(id).running = true;
-      return { ok: true };
-    },
-
-    'self-driving-car:stop': (_, opts = {}) => {
-      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
-      getSession(id).running = false;
-      return { ok: true };
-    },
-
-    'self-driving-car:newTrack': (_, opts = {}) => {
-      const id   = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
-      const seed = (typeof opts === 'object' ? opts.seed : opts) || null;
-      const s    = getSession(id);
-      if (!s.pop) return { error: 'Not initialized.' };
-      s.track  = generateTrack((seed || Math.floor(Math.random() * 0xFFFFFF)) >>> 0);
-      s.cars   = Array.from({ length: s.popSize }, () => spawnCar(s.track));
-      s.carFit = new Array(s.popSize).fill(0);
-      return { ok: true, track: s.track };
-    },
-
-    'self-driving-car:reset': (_, opts = {}) => {
-      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
-      const s  = getSession(id);
-      if (!Population || !T) return { error: 'Not initialized.' };
-      const seed = Math.floor(Math.random() * 0xFFFFFF);
-      s.track = generateTrack(seed);
-      s.pop   = new Population({
-        architecture: {
-          kind: 'classifier',
-          inputDim: INPUT_DIM, outputDim: OUTPUT_DIM,
-          hidden: [64, 32, 16], activation: 'tanh', dropout: 0,
-        },
-        size: s.popSize,
-        eliteCount: Math.max(1, Math.floor(s.popSize * 0.2)),
-        pMutate: 0.15, mutationStd: 0.05,
-        tournamentK: 3, seed: seed,
-      });
-      s.cars       = Array.from({ length: s.popSize }, () => spawnCar(s.track));
-      s.carFit     = new Array(s.popSize).fill(0);
-      s.generation = 0;
-      s.bestFit    = 0;
-      s.genBestFit = 0;
-      s.running    = true;
-      s.genHistory = [];
-      return { ok: true };
-    },
-
-    // ── Inference handlers ──────────────────────────────────────────────────
-
-    'self-driving-car:inferInit': (_, opts = {}) => {
-      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
-      const s  = getSession(id);
-      if (!s.pop || !s.track) return { error: 'No trained model — run training first.' };
-      const genome = s.pop.bestIndividual || s.pop.individuals[0];
-      if (!genome) return { error: 'Population not ready.' };
-      s.inferCar   = spawnCar(s.track);
-      s.inferTrack = s.track;
-      return {
-        ok: true,
-        track: s.inferTrack,
-        generation: s.generation,
-        bestFit: +s.bestFit.toFixed(3),
-      };
-    },
-
-    'self-driving-car:inferStep': (_, opts = {}) => {
-      const id       = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
-      const noiseStd = (typeof opts === 'object' ? opts.noiseStd : opts) || 0;
-      const s        = getSession(id);
-      if (!s.inferCar || !s.inferTrack || !s.pop) return null;
-      const genome = s.pop.bestIndividual || s.pop.individuals[0];
-      if (!genome) return null;
-
-      const rawInputs = senseCar(s.inferCar, s.inferTrack);
-      let inputs = rawInputs;
-      if (noiseStd > 0) {
-        inputs = new Float32Array(rawInputs.length);
-        for (let i = 0; i < rawInputs.length; i++) {
-          inputs[i] = rawInputs[i] + gaussRand() * noiseStd;
+        // Resume from saved state when available; fall back to fresh population.
+        const savedPop = loadPopFromStorage(storage, id);
+        if (savedPop) {
+          s.pop = savedPop;
+          s.pop.mutationStd = mutStd;
+          s.generation = s.pop.generation || 0;
+          s.bestFit    = Math.max(0, isFinite(s.pop.bestFitness) ? s.pop.bestFitness : 0);
+          s.genHistory = (s.pop.history || []).slice(-100).map((h, i) => ({
+            gen:  h.generation ?? i,
+            best: +(h.stats?.max ?? 0).toFixed(3),
+            mean: +(h.stats?.mean ?? 0).toFixed(3),
+          }));
+        } else {
+          s.pop = new Population({
+            architecture: ARCH,
+            size: s.popSize,
+            eliteCount: Math.max(1, Math.floor(s.popSize * 0.2)),
+            pMutate: 0.15, mutationStd: mutStd,
+            tournamentK: 3, seed: opts.seed || 42,
+          });
+          s.generation = 0;
+          s.bestFit    = 0;
+          s.genHistory = [];
         }
-      }
 
-      const outs     = netForward(genome, inputs);
-      const steer    = Math.max(-1, Math.min(1, outs[0]));
-      const throttle = Math.max(-1, Math.min(1, outs[1]));
-      stepCar(s.inferCar, steer, throttle);
-      updateCarProgress(s.inferCar, s.inferTrack);
+        s.cars       = Array.from({ length: s.popSize }, () => spawnCar(s.track));
+        s.carFit     = new Array(s.popSize).fill(0);
+        s.genBestFit = 0;
+        s.running    = true;
 
-      const dead = !isOnTrack(s.inferCar.x, s.inferCar.y, s.inferTrack) || s.inferCar.frames >= MAX_FRAMES;
-      if (dead) s.inferCar = spawnCar(s.inferTrack);
+        return { ok: true, track: s.track, resumed: !!savedPop, generation: s.generation };
+      },
 
-      return {
-        track: s.inferTrack,
-        car: {
-          x: s.inferCar.x, y: s.inferCar.y,
-          angle: s.inferCar.angle, speed: s.inferCar.speed, laps: s.inferCar.laps,
-        },
-        justReset: dead,
-      };
+      'self-driving-car:getState': (_, opts = {}) => {
+        const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+        return buildVisualState(getSession(id));
+      },
+
+      'self-driving-car:step': (_, opts = {}) => {
+        const id = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
+        return stepGeneration(getSession(id), opts);
+      },
+
+      'self-driving-car:start': (_, opts = {}) => {
+        const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+        getSession(id).running = true;
+        return { ok: true };
+      },
+
+      'self-driving-car:stop': (_, opts = {}) => {
+        const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+        const s  = getSession(id);
+        s.running = false;
+        savePopToStorage(storage, id, s);
+        return { ok: true };
+      },
+
+      'self-driving-car:newTrack': (_, opts = {}) => {
+        const id   = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
+        const seed = (typeof opts === 'object' ? opts.seed : opts) || null;
+        const s    = getSession(id);
+        if (!s.pop) return { error: 'Not initialized.' };
+        s.track  = generateTrack((seed || Math.floor(Math.random() * 0xFFFFFF)) >>> 0);
+        s.cars   = Array.from({ length: s.popSize }, () => spawnCar(s.track));
+        s.carFit = new Array(s.popSize).fill(0);
+        return { ok: true, track: s.track };
+      },
+
+      'self-driving-car:reset': (_, opts = {}) => {
+        const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+        const s  = getSession(id);
+        if (!Population || !T) return { error: 'Not initialized.' };
+        const seed = Math.floor(Math.random() * 0xFFFFFF);
+        s.track = generateTrack(seed);
+        s.pop   = new Population({
+          architecture: ARCH,
+          size: s.popSize,
+          eliteCount: Math.max(1, Math.floor(s.popSize * 0.2)),
+          pMutate: 0.15, mutationStd: 0.05,
+          tournamentK: 3, seed: seed,
+        });
+        s.cars       = Array.from({ length: s.popSize }, () => spawnCar(s.track));
+        s.carFit     = new Array(s.popSize).fill(0);
+        s.generation = 0;
+        s.bestFit    = 0;
+        s.genBestFit = 0;
+        s.running    = true;
+        s.genHistory = [];
+        return { ok: true };
+      },
+
+      // ── Save / load handlers ────────────────────────────────────────────────
+
+      'self-driving-car:saveState': (_, opts = {}) => {
+        const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+        const s  = getSession(id);
+        if (!s.pop) return { error: 'No trained model — run training first.' };
+        savePopToStorage(storage, id, s);
+        return { ok: true, generation: s.generation, bestFit: +s.bestFit.toFixed(3) };
+      },
+
+      'self-driving-car:loadState': (_, opts = {}) => {
+        const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+        const s  = getSession(id);
+        const pop = loadPopFromStorage(storage, id);
+        if (!pop) return { error: 'No saved state found for this network.' };
+        const wasRunning = s.running;
+        s.running    = false;
+        s.pop        = pop;
+        s.popSize    = pop.size;
+        s.generation = pop.generation || 0;
+        s.bestFit    = Math.max(0, isFinite(pop.bestFitness) ? pop.bestFitness : 0);
+        s.genHistory = (pop.history || []).slice(-100).map((h, i) => ({
+          gen:  h.generation ?? i,
+          best: +(h.stats?.max ?? 0).toFixed(3),
+          mean: +(h.stats?.mean ?? 0).toFixed(3),
+        }));
+        if (s.track) {
+          s.cars   = Array.from({ length: s.popSize }, () => spawnCar(s.track));
+          s.carFit = new Array(s.popSize).fill(0);
+        }
+        if (wasRunning) s.running = true;
+        return { ok: true, generation: s.generation, bestFit: +s.bestFit.toFixed(3) };
+      },
+
+      // ── Inference handlers ──────────────────────────────────────────────────
+
+      'self-driving-car:inferInit': (_, opts = {}) => {
+        const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+        const s  = getSession(id);
+
+        // If no live session, try to load from storage for infer-only use.
+        if (!s.pop && storage) {
+          const pop = loadPopFromStorage(storage, id);
+          if (pop) {
+            s.pop        = pop;
+            s.popSize    = pop.size;
+            s.generation = pop.generation || 0;
+            s.bestFit    = Math.max(0, isFinite(pop.bestFitness) ? pop.bestFitness : 0);
+          }
+        }
+
+        if (!s.pop || !s.track) return { error: 'No trained model — run training first.' };
+        const genome = s.pop.bestIndividual || s.pop.individuals[0];
+        if (!genome) return { error: 'Population not ready.' };
+        s.inferCar   = spawnCar(s.track);
+        s.inferTrack = s.track;
+        return {
+          ok: true,
+          track: s.inferTrack,
+          generation: s.generation,
+          bestFit: +s.bestFit.toFixed(3),
+        };
+      },
+
+      'self-driving-car:inferStep': (_, opts = {}) => {
+        const id       = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
+        const noiseStd = (typeof opts === 'object' ? opts.noiseStd : opts) || 0;
+        const s        = getSession(id);
+        if (!s.inferCar || !s.inferTrack || !s.pop) return null;
+        const genome = s.pop.bestIndividual || s.pop.individuals[0];
+        if (!genome) return null;
+
+        const rawInputs = senseCar(s.inferCar, s.inferTrack);
+        let inputs = rawInputs;
+        if (noiseStd > 0) {
+          inputs = new Float32Array(rawInputs.length);
+          for (let i = 0; i < rawInputs.length; i++) {
+            inputs[i] = rawInputs[i] + gaussRand() * noiseStd;
+          }
+        }
+
+        const outs     = netForward(genome, inputs);
+        const steer    = Math.max(-1, Math.min(1, outs[0]));
+        const throttle = Math.max(-1, Math.min(1, outs[1]));
+        stepCar(s.inferCar, steer, throttle);
+        updateCarProgress(s.inferCar, s.inferTrack);
+
+        const dead = !isOnTrack(s.inferCar.x, s.inferCar.y, s.inferTrack) || s.inferCar.frames >= MAX_FRAMES;
+        if (dead) s.inferCar = spawnCar(s.inferTrack);
+
+        return {
+          track: s.inferTrack,
+          car: {
+            x: s.inferCar.x, y: s.inferCar.y,
+            angle: s.inferCar.angle, speed: s.inferCar.speed, laps: s.inferCar.laps,
+          },
+          justReset: dead,
+        };
+      },
     },
-  },
+  };
 };

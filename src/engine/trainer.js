@@ -556,22 +556,26 @@ function infer(network, input, cache) {
         }
       }
       // Chat-mode early-stop on the '<|' bigram (any role-tag attempt, even
-      // corrupted). Decode just the new char and keep the last few in a tail.
+      // corrupted) and on the closing '|>' bigram (a small charLM can emit the
+      // tail of a role tag without the leading '<|'). Decode just the new char
+      // and keep the last few in a tail — avoids a full decode every step.
       if (isChat) {
         tailDecoded += tokenizer.decode([pick]);
         if (tailDecoded.length > 8) tailDecoded = tailDecoded.slice(-8);
         const bigramAt = tailDecoded.indexOf(tagOpenBigram);
-        if (bigramAt !== -1) {
-          // We need to trim `out` so the decoded output ends just before '<|'.
-          // The simplest robust approach: decode the entire `out`, find the
-          // first '<|', then re-encode the prefix and keep only those tokens.
-          // This costs one full decode at stop time, not every step.
+        const tagTailAt = tailDecoded.indexOf('|>');
+        if (bigramAt !== -1 || tagTailAt !== -1) {
+          // Decode the full output and cut just before whichever fragment
+          // appeared first — handles both '<|...' and orphaned '|>' tails.
           const fullDecoded = tokenizer.decode(out);
-          const cut = fullDecoded.indexOf(tagOpenBigram);
-          if (cut !== -1) {
-            const keepText = fullDecoded.slice(0, cut);
-            // Re-encode (encodeSafe drops unknowns) — for charLM this is exact.
-            const keepIds = tokenizer.encodeSafe(keepText);
+          const cutStart = fullDecoded.indexOf(tagOpenBigram);
+          const cutTail  = fullDecoded.indexOf('|>');
+          const cut = Math.min(
+            cutStart !== -1 ? cutStart : Infinity,
+            cutTail  !== -1 ? cutTail  : Infinity
+          );
+          if (cut !== Infinity) {
+            const keepIds = tokenizer.encodeSafe(fullDecoded.slice(0, cut));
             out.length = 0;
             for (const t of keepIds) out.push(t);
           }
@@ -701,10 +705,17 @@ async function inferStream(network, input, onToken, cancelRef, cache) {
     if (isChat) {
       tailDecoded += chunk;
       if (tailDecoded.length > 8) tailDecoded = tailDecoded.slice(-8);
-      if (tailDecoded.indexOf(tagOpenBigram) !== -1) {
+      const bigramAt = tailDecoded.indexOf(tagOpenBigram);
+      const tagTailAt = tailDecoded.indexOf('|>');
+      if (bigramAt !== -1 || tagTailAt !== -1) {
         const fullDecoded = tokenizer.decode(out);
-        const cut = fullDecoded.indexOf(tagOpenBigram);
-        if (cut !== -1) {
+        const cutStart = fullDecoded.indexOf(tagOpenBigram);
+        const cutTail  = fullDecoded.indexOf('|>');
+        const cut = Math.min(
+          cutStart !== -1 ? cutStart : Infinity,
+          cutTail  !== -1 ? cutTail  : Infinity
+        );
+        if (cut !== Infinity) {
           const keepIds = tokenizer.encodeSafe(fullDecoded.slice(0, cut));
           out.length = 0;
           for (const t of keepIds) out.push(t);

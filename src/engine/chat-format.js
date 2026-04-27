@@ -204,6 +204,11 @@ function extractAssistantReply(generated) {
   if (endIdx !== -1) cutPoints.push(endIdx);
   const tagStartIdx = generated.indexOf('<|');
   if (tagStartIdx !== -1) cutPoints.push(tagStartIdx);
+  // Also cut on the tail bigram '|>' — a small charLM can emit the closing half
+  // of a role tag (e.g. "end|>", "user|>") without the leading "<|", bypassing
+  // the tagStartIdx check above.
+  const tagTailIdx = generated.indexOf('|>');
+  if (tagTailIdx !== -1) cutPoints.push(tagTailIdx);
   if (cutPoints.length === 0) return generated;
   return generated.slice(0, Math.min(...cutPoints));
 }

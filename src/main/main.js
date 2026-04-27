@@ -17,7 +17,7 @@ const trainer = new TrainingManager(storage);
 
 const pluginLoader = new PluginLoader(path.join(userDataDir, 'plugins'));
 pluginLoader.seedBuiltins(path.join(__dirname, '..', 'plugins'));
-pluginLoader.load(ipcMain);
+pluginLoader.load(ipcMain, storage);
 
 let mainWindow = null;
 
