@@ -11,21 +11,25 @@ try {
 }
 
 // ── Environment constants ─────────────────────────────────────────────────────
-const GRID      = 8;
-const N_BOXES   = 3;
-const MAX_STEPS = 200;
-const STATE_DIM = 2 + N_BOXES * 2 + N_BOXES * 2;  // 14 floats
-const N_ACTIONS = 4;
-const DIRS      = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+const GRID       = 8;
+const MAX_STEPS  = 200;
+const N_ACTIONS  = 4;
+const N_OBSTACLES = 4;
+const DIRS       = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+
+// State: robot(2) + carrying(1) + boxes(nBoxes×2) + targets(nBoxes×2)
+//        + box→target relative offsets(nBoxes×2) + robot→goal relative(2)
+// = 5 + nBoxes×6
+function computeStateDim(nBoxes) { return 5 + nBoxes * 6; }
 
 // ── Per-instance sessions ─────────────────────────────────────────────────────
-// Each network gets its own isolated state keyed by instanceId.
 function makeSession() {
   return {
     agent: null, env: null, running: false,
     episode: 0, epReward: 0, totalSteps: 0,
     bestReward: -Infinity, rewardHistory: [],
     inferEnv: null, inferEpReward: 0, inferLapsDone: 0,
+    nBoxes: 1,
   };
 }
 const _sessions = new Map();
@@ -35,104 +39,196 @@ function getSession(id) {
   return _sessions.get(key);
 }
 
-// ── LCG for seeded random positions ──────────────────────────────────────────
+// ── LCG for seeded obstacle generation ───────────────────────────────────────
 function lcg(s) { return (Math.imul(s | 0, 1664525) + 1013904223) >>> 0; }
 
-// ── Grid helpers ──────────────────────────────────────────────────────────────
-
-function resetEnv(seed) {
-  let rng = (seed || (Math.floor(Math.random() * 0x7FFFFFFF) + 1)) >>> 0;
+function generateObstacles(seed) {
+  let rng = (seed || 0xABCD1234) >>> 0;
   const used = new Set();
-
   function randCell() {
-    let r, c;
+    let r, c, key;
     do {
-      rng = lcg(rng); r = rng % GRID;
-      rng = lcg(rng); c = rng % GRID;
-    } while (used.has(r * GRID + c));
-    used.add(r * GRID + c);
+      rng = lcg(rng); r = Math.floor((rng / 4294967296) * GRID);
+      rng = lcg(rng); c = Math.floor((rng / 4294967296) * GRID);
+      key = r * GRID + c;
+    } while (used.has(key));
+    used.add(key);
     return [r, c];
   }
+  return Array.from({ length: N_OBSTACLES }, randCell);
+}
 
+// ── Per-episode reset ─────────────────────────────────────────────────────────
+function resetEpisode(nBoxes, obstacles) {
+  const used = new Set(obstacles.map(([r, c]) => r * GRID + c));
+  function randCell() {
+    let r, c, key;
+    do {
+      r = Math.floor(Math.random() * GRID);
+      c = Math.floor(Math.random() * GRID);
+      key = r * GRID + c;
+    } while (used.has(key));
+    used.add(key);
+    return [r, c];
+  }
   const robot   = randCell();
-  const boxes   = [randCell(), randCell(), randCell()];
-  const targets = [randCell(), randCell(), randCell()];
-  return { robot, boxes, targets, step: 0, onTarget: countOnTarget(boxes, targets) };
+  const boxes   = Array.from({ length: nBoxes }, randCell);
+  const targets = Array.from({ length: nBoxes }, randCell);
+  return {
+    robot, boxes, targets, obstacles,
+    carrying: -1,
+    deliveredMask: new Array(nBoxes).fill(false),
+    delivered: 0,
+    step: 0,
+  };
 }
 
-function countOnTarget(boxes, targets) {
-  let n = 0;
-  for (const t of targets)
-    if (boxes.some(b => b[0] === t[0] && b[1] === t[1])) n++;
-  return n;
-}
-
-function encodeState(env) {
+// ── State encoding ────────────────────────────────────────────────────────────
+function encodeState(env, nBoxes) {
   const G = GRID - 1;
-  const v = new Float32Array(STATE_DIM);
-  v[0] = env.robot[0] / G;
-  v[1] = env.robot[1] / G;
-  for (let i = 0; i < N_BOXES; i++) {
-    v[2 + i * 2]     = env.boxes[i][0] / G;
-    v[2 + i * 2 + 1] = env.boxes[i][1] / G;
+  const v = new Float32Array(computeStateDim(nBoxes));
+  let idx = 0;
+
+  v[idx++] = env.robot[0] / G;
+  v[idx++] = env.robot[1] / G;
+  v[idx++] = env.carrying >= 0 ? 1.0 : 0.0;
+
+  // Absolute box positions (at target if delivered, at robot if carried)
+  for (let i = 0; i < nBoxes; i++) {
+    let br, bc;
+    if (env.deliveredMask[i])    { [br, bc] = env.targets[i]; }
+    else if (env.carrying === i) { [br, bc] = env.robot; }
+    else                         { [br, bc] = env.boxes[i]; }
+    v[idx++] = br / G;
+    v[idx++] = bc / G;
   }
-  for (let i = 0; i < N_BOXES; i++) {
-    v[2 + N_BOXES * 2 + i * 2]     = env.targets[i][0] / G;
-    v[2 + N_BOXES * 2 + i * 2 + 1] = env.targets[i][1] / G;
+
+  // Absolute target positions
+  for (let i = 0; i < nBoxes; i++) {
+    v[idx++] = env.targets[i][0] / G;
+    v[idx++] = env.targets[i][1] / G;
   }
+
+  // Relative box→target offset for each box (direct "error vector")
+  for (let i = 0; i < nBoxes; i++) {
+    if (env.deliveredMask[i]) {
+      v[idx++] = 0; v[idx++] = 0;
+    } else {
+      const [br, bc] = env.carrying === i ? env.robot : env.boxes[i];
+      v[idx++] = (env.targets[i][0] - br) / G;
+      v[idx++] = (env.targets[i][1] - bc) / G;
+    }
+  }
+
+  // Relative robot→immediate goal (nearest undelivered box if not carrying; target if carrying)
+  if (env.carrying >= 0) {
+    const [tr, tc] = env.targets[env.carrying];
+    v[idx++] = (tr - env.robot[0]) / G;
+    v[idx++] = (tc - env.robot[1]) / G;
+  } else {
+    let bestDr = 0, bestDc = 0, bestD = Infinity;
+    for (let i = 0; i < nBoxes; i++) {
+      if (!env.deliveredMask[i]) {
+        const d = Math.abs(env.robot[0] - env.boxes[i][0]) + Math.abs(env.robot[1] - env.boxes[i][1]);
+        if (d < bestD) {
+          bestD = d;
+          bestDr = env.boxes[i][0] - env.robot[0];
+          bestDc = env.boxes[i][1] - env.robot[1];
+        }
+      }
+    }
+    v[idx++] = bestDr / G;
+    v[idx++] = bestDc / G;
+  }
+
   return v;
 }
 
-function stepEnv(env, action) {
+// ── Shaping potential ─────────────────────────────────────────────────────────
+function shapingPotential(env, nBoxes) {
+  if (env.carrying >= 0) {
+    const [tr, tc] = env.targets[env.carrying];
+    return -(Math.abs(env.robot[0] - tr) + Math.abs(env.robot[1] - tc));
+  }
+  let best = Infinity;
+  for (let i = 0; i < nBoxes; i++) {
+    if (!env.deliveredMask[i]) {
+      const d = Math.abs(env.robot[0] - env.boxes[i][0]) + Math.abs(env.robot[1] - env.boxes[i][1]);
+      best = Math.min(best, d);
+    }
+  }
+  return best === Infinity ? 0 : -best;
+}
+
+// ── Environment step ──────────────────────────────────────────────────────────
+function stepEnv(env, action, nBoxes) {
   const [dr, dc] = DIRS[action];
   const [r, c]   = env.robot;
   const nr = r + dr, nc = c + dc;
+  const nextStep = env.step + 1;
 
   if (nr < 0 || nr >= GRID || nc < 0 || nc >= GRID) {
-    return { env: { ...env, step: env.step + 1 }, reward: -0.5, done: env.step + 1 >= MAX_STEPS };
+    return { env: { ...env, step: nextStep }, reward: -0.5, done: nextStep >= MAX_STEPS };
   }
 
-  let boxes = env.boxes;
-  const bi  = boxes.findIndex(b => b[0] === nr && b[1] === nc);
-
-  if (bi >= 0) {
-    const bnr = nr + dr, bnc = nc + dc;
-    if (bnr < 0 || bnr >= GRID || bnc < 0 || bnc >= GRID ||
-        boxes.some((b, i) => i !== bi && b[0] === bnr && b[1] === bnc)) {
-      return { env: { ...env, step: env.step + 1 }, reward: -0.4, done: env.step + 1 >= MAX_STEPS };
-    }
-    boxes = boxes.map((b, i) => i === bi ? [bnr, bnc] : b);
+  if (env.obstacles.some(o => o[0] === nr && o[1] === nc)) {
+    return { env: { ...env, step: nextStep }, reward: -0.3, done: nextStep >= MAX_STEPS };
   }
 
-  const newEnv = { ...env, robot: [nr, nc], boxes, step: env.step + 1 };
-  const onNow  = countOnTarget(newEnv.boxes, newEnv.targets);
-  const onPrev = env.onTarget;
-  newEnv.onTarget = onNow;
-
+  const oldPotential = shapingPotential(env, nBoxes);
+  let newEnv = { ...env, robot: [nr, nc], step: nextStep };
   let reward = -0.01;
-  if (onNow > onPrev) reward += 10 * (onNow - onPrev);
-  if (onNow < onPrev) reward -= 3  * (onPrev - onNow);
 
-  const done = (onNow === N_BOXES) || (newEnv.step >= MAX_STEPS);
-  if (onNow === N_BOXES) reward += 50;
+  // Pick up undelivered box at new cell (only if not already carrying)
+  if (newEnv.carrying < 0) {
+    for (let i = 0; i < nBoxes; i++) {
+      if (!newEnv.deliveredMask[i] && newEnv.boxes[i][0] === nr && newEnv.boxes[i][1] === nc) {
+        newEnv = { ...newEnv, carrying: i };
+        reward += 1.0;
+        break;
+      }
+    }
+  }
 
+  // Deliver carried box to its target
+  if (newEnv.carrying >= 0) {
+    const bi = newEnv.carrying;
+    if (newEnv.targets[bi][0] === nr && newEnv.targets[bi][1] === nc) {
+      const deliveredMask = [...newEnv.deliveredMask];
+      deliveredMask[bi] = true;
+      const delivered = newEnv.delivered + 1;
+      newEnv = { ...newEnv, carrying: -1, deliveredMask, delivered };
+      reward += 10.0;
+      if (delivered === nBoxes) reward += 50.0;
+    }
+  }
+
+  // Potential-based dense shaping (scaled small to not overpower event rewards)
+  reward += 0.1 * (shapingPotential(newEnv, nBoxes) - oldPotential);
+
+  const done = (newEnv.delivered === nBoxes) || (nextStep >= MAX_STEPS);
   return { env: newEnv, reward, done };
 }
 
+// ── Visual state ──────────────────────────────────────────────────────────────
 function buildVisualState(s) {
   if (!s.env) return null;
+  const env = s.env;
   return {
-    grid: GRID, nBoxes: N_BOXES,
-    robot:    s.env.robot,
-    boxes:    s.env.boxes,
-    targets:  s.env.targets,
-    onTarget: s.env.onTarget,
-    episode:  s.episode,
-    stepInEp: s.env.step,
-    totalSteps: s.totalSteps,
-    epReward: +s.epReward.toFixed(2),
-    bestReward: s.bestReward === -Infinity ? null : +s.bestReward.toFixed(2),
-    epsilon:  s.agent ? +s.agent.epsilon.toFixed(4) : 1.0,
+    grid: GRID, nBoxes: s.nBoxes,
+    robot:         env.robot,
+    carrying:      env.carrying,
+    boxes:         env.boxes,
+    targets:       env.targets,
+    obstacles:     env.obstacles,
+    deliveredMask: env.deliveredMask,
+    delivered:     env.delivered,
+    episode:       s.episode,
+    stepInEp:      env.step,
+    totalSteps:    s.totalSteps,
+    epReward:      +s.epReward.toFixed(2),
+    bestReward:    s.bestReward === -Infinity ? null : +s.bestReward.toFixed(2),
+    epsilon:       s.agent ? +s.agent.epsilon.toFixed(4) : 1.0,
     rewardHistory: s.rewardHistory.slice(-80),
   };
 }
@@ -150,29 +246,34 @@ module.exports = {
       if (!_DQNAgent) return { error: 'DQNAgent module unavailable — check app bundle.' };
       const id = opts.instanceId || 'default';
       const s  = getSession(id);
+
+      s.nBoxes = Math.max(1, Math.min(5, (opts.nBoxes | 0) || 1));
+      const obstacles = generateObstacles(opts.seed || 42);
+
       s.agent = new _DQNAgent({
         architecture: {
           kind: 'classifier',
-          inputDim: STATE_DIM, outputDim: N_ACTIONS,
+          inputDim: computeStateDim(s.nBoxes), outputDim: N_ACTIONS,
           hidden: [128, 64], activation: 'relu', dropout: 0,
         },
         gamma: 0.95,
         lr: opts.lr || opts.learningRate || 1e-3,
         batchSize:      opts.batchSize || 64,
-        bufferCapacity: 5000,   // smaller buffer = less NAPI data per sample call
-        epsilonStart: 1.0, epsilonEnd: 0.05, epsilonDecay: 0.9995,
+        bufferCapacity: 5000,
+        epsilonStart: 1.0, epsilonEnd: 0.05, epsilonDecay: 0.999,
         targetUpdateFreq: 200,
         seed: opts.seed || 42,
         optimizer: 'adam',
       });
-      s.env          = resetEnv(opts.seed);
+
+      s.env          = resetEpisode(s.nBoxes, obstacles);
       s.running      = true;
       s.episode      = 0;
       s.epReward     = 0;
       s.totalSteps   = 0;
       s.bestReward   = -Infinity;
       s.rewardHistory = [];
-      return { ok: true, grid: GRID, nBoxes: N_BOXES };
+      return { ok: true, grid: GRID, nBoxes: s.nBoxes };
     },
 
     'warehouse-robot:getState': (_, opts = {}) => {
@@ -180,8 +281,6 @@ module.exports = {
       return buildVisualState(getSession(id));
     },
 
-    // KEY FIX: collect n steps, then train ONCE — avoids blocking the main
-    // process with N full backprop passes per IPC call.
     'warehouse-robot:step': (_, opts = {}) => {
       const id = (typeof opts === 'object' ? opts.instanceId : null) || 'default';
       const s  = getSession(id);
@@ -189,10 +288,10 @@ module.exports = {
       const n = Math.max(1, Math.min((opts.n || (typeof opts === 'number' ? opts : 4)) | 0, 20));
 
       for (let i = 0; i < n; i++) {
-        const state  = encodeState(s.env);
+        const state  = encodeState(s.env, s.nBoxes);
         const a      = s.agent.selectAction(state);
-        const { env: next, reward, done } = stepEnv(s.env, a);
-        const ns     = encodeState(next);
+        const { env: next, reward, done } = stepEnv(s.env, a, s.nBoxes);
+        const ns     = encodeState(next, s.nBoxes);
         s.agent.observe(state, a, reward, ns, done);
         s.epReward   += reward;
         s.totalSteps += 1;
@@ -204,15 +303,11 @@ module.exports = {
           if (s.epReward > s.bestReward) s.bestReward = s.epReward;
           s.episode++;
           s.epReward = 0;
-          s.env = resetEnv();
+          s.env = resetEpisode(s.nBoxes, s.env.obstacles);
         }
       }
 
-      // Train once per IPC call rather than once per step.
-      // This prevents the replay buffer's NAPI array conversion from
-      // blocking the main process N times per frame.
       if (s.agent.buffer.ready) s.agent.trainStep();
-
       return buildVisualState(s);
     },
 
@@ -221,6 +316,7 @@ module.exports = {
       getSession(id).running = true;
       return { ok: true };
     },
+
     'warehouse-robot:stop': (_, opts = {}) => {
       const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
       getSession(id).running = false;
@@ -231,28 +327,26 @@ module.exports = {
       const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
       const s  = getSession(id);
       if (!s.agent) return { error: 'Not initialized — call init first.' };
-      s.env          = resetEnv();
-      s.episode      = 0;
-      s.epReward     = 0;
-      s.totalSteps   = 0;
-      s.bestReward   = -Infinity;
+      s.env           = resetEpisode(s.nBoxes, s.env.obstacles);
+      s.episode       = 0;
+      s.epReward      = 0;
+      s.totalSteps    = 0;
+      s.bestReward    = -Infinity;
       s.rewardHistory = [];
       s.agent.epsilon = s.agent.epsilonStart;
-      s.running      = true;
+      s.running       = true;
       return { ok: true };
     },
-
-    // ── Inference handlers ────────────────────────────────────────────────
 
     'warehouse-robot:inferInit': (_, opts = {}) => {
       const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
       const s  = getSession(id);
       if (!s.agent) return { error: 'No trained agent — run training first.' };
-      s.inferEnv      = resetEnv();
+      s.inferEnv      = resetEpisode(s.nBoxes, s.env.obstacles);
       s.inferEpReward = 0;
       s.inferLapsDone = 0;
       return {
-        ok: true, grid: GRID, nBoxes: N_BOXES,
+        ok: true, grid: GRID, nBoxes: s.nBoxes,
         epsilon:    +s.agent.epsilon.toFixed(4),
         totalSteps: s.totalSteps,
         episode:    s.episode,
@@ -266,7 +360,7 @@ module.exports = {
       const s        = getSession(id);
       if (!s.agent || !s.inferEnv) return null;
 
-      const rawState = encodeState(s.inferEnv);
+      const rawState = encodeState(s.inferEnv, s.nBoxes);
       let state = rawState;
       if (noiseStd > 0) {
         state = new Float32Array(rawState.length);
@@ -278,7 +372,7 @@ module.exports = {
       const action = s.agent.selectAction(state);
       s.agent.epsilon = savedEps;
 
-      const { env: next, reward, done } = stepEnv(s.inferEnv, action);
+      const { env: next, reward, done } = stepEnv(s.inferEnv, action, s.nBoxes);
       s.inferEpReward += reward;
       s.inferEnv       = next;
 
@@ -286,18 +380,21 @@ module.exports = {
       if (done) {
         s.inferLapsDone++;
         s.inferEpReward = 0;
-        s.inferEnv      = resetEnv();
+        s.inferEnv      = resetEpisode(s.nBoxes, s.env.obstacles);
         justReset       = true;
       }
 
       return {
-        grid: GRID, nBoxes: N_BOXES,
-        robot:    s.inferEnv.robot,
-        boxes:    s.inferEnv.boxes,
-        targets:  s.inferEnv.targets,
-        onTarget: s.inferEnv.onTarget,
-        epReward: +s.inferEpReward.toFixed(2),
-        episodesDone: s.inferLapsDone,
+        grid: GRID, nBoxes: s.nBoxes,
+        robot:         s.inferEnv.robot,
+        carrying:      s.inferEnv.carrying,
+        boxes:         s.inferEnv.boxes,
+        targets:       s.inferEnv.targets,
+        obstacles:     s.inferEnv.obstacles,
+        deliveredMask: s.inferEnv.deliveredMask,
+        delivered:     s.inferEnv.delivered,
+        epReward:      +s.inferEpReward.toFixed(2),
+        episodesDone:  s.inferLapsDone,
         justReset,
       };
     },

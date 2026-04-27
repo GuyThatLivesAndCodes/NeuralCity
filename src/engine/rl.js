@@ -51,24 +51,10 @@ class ReplayBuffer {
 
   // Sample a random mini-batch. Returns { states, actions, rewards, nextStates, dones }
   // each as Float32Array.
-  sample(batchSize, seed) {
-    const rust = getRust();
-    if (rust && this.size >= batchSize) {
-      const s = (seed ?? (Math.random() * 0xFFFFFFFF)) >>> 0;
-      const result = rust.replayBufferSample(
-        Array.from(this.states), Array.from(this.actions),
-        Array.from(this.rewards), Array.from(this.nextStates), Array.from(this.dones),
-        this.size, this.stateDim, this.actionDim, batchSize, s
-      );
-      return {
-        states: new Float32Array(result.states),
-        actions: new Float32Array(result.actions),
-        rewards: new Float32Array(result.rewards),
-        nextStates: new Float32Array(result.nextStates),
-        dones: new Float32Array(result.dones),
-      };
-    }
-    // JS fallback
+  // NOTE: always uses typed-array subarray copies (O(batchSize)), never Array.from on the
+  // full buffer. Passing Array.from(Float32Array(capacity × stateDim)) to NAPI boxes every
+  // element as a heap Number, causing GC pressure that freezes the main process.
+  sample(batchSize) {
     const n = this.size;
     const sd = this.stateDim, ad = this.actionDim;
     const states = new Float32Array(batchSize * sd);
