@@ -6,6 +6,76 @@ const os = require('os');
 const { EventEmitter } = require('events');
 const { infer } = require('../engine/trainer');
 
+// Lazy-loaded plugin engines (only required when a plugin network is served).
+let _T = null;
+let _restoreFromState = null;
+function getTensor() { return _T || (_T = require('../engine/tensor')); }
+function getRestore() { return _restoreFromState || (_restoreFromState = require('../engine/model').restoreFromState); }
+
+function _argmax(arr) {
+  let best = 0;
+  for (let i = 1; i < arr.length; i++) if (arr[i] > arr[best]) best = i;
+  return best;
+}
+
+// Run inference against a plugin network's saved state.
+// Neuroevolution plugins save Population.toJSON() → individuals[0] is the elite.
+// DQN plugins save DQNAgent.toJSON() → onlineState is the policy network.
+function pluginPredict(net, payload) {
+  const arch  = net.architecture;
+  const state = net.state;
+  const T     = getTensor();
+  const restore = getRestore();
+
+  const rawInputs = payload.inputs ?? payload.input;
+  if (!rawInputs || !Array.isArray(rawInputs)) {
+    throw new Error(`"inputs" is required — provide an array of ${arch.inputDim} numbers`);
+  }
+
+  let modelState, modelArch;
+  if (Array.isArray(state.individuals)) {
+    // Neuroevolution (self-driving-car, snake-neuro): elite is at index 0.
+    modelState = state.individuals[0];
+    modelArch  = state.arch || arch;
+  } else if (state.onlineState) {
+    // DQN (warehouse-robot): use the online policy network.
+    modelState = state.onlineState;
+    modelArch  = state.arch || arch;
+  } else {
+    throw new Error('Unrecognised plugin state format — ensure you have saved a trained model.');
+  }
+
+  if (rawInputs.length !== modelArch.inputDim) {
+    throw new Error(`Expected ${modelArch.inputDim} inputs, got ${rawInputs.length}`);
+  }
+
+  const rng   = T.rngFromSeed(42);
+  const model = restore(modelState, modelArch, rng);
+  const x     = new T.Tensor([1, modelArch.inputDim], new Float32Array(rawInputs), false);
+  const out   = model.forward(x, { training: false });
+  const outputs = Array.from(out.data);
+
+  const pluginKind = arch.pluginKind;
+  if (pluginKind === 'self-driving-car') {
+    return {
+      outputs,
+      steer:    Math.max(-1, Math.min(1, outputs[0])),
+      throttle: Math.max(-1, Math.min(1, outputs[1])),
+    };
+  }
+  if (pluginKind === 'snake-neuro') {
+    const DIRS = ['up', 'right', 'down', 'left'];
+    const dir  = _argmax(outputs);
+    return { outputs, direction: dir, directionName: DIRS[dir] };
+  }
+  if (pluginKind === 'warehouse-robot') {
+    const ACTIONS = ['up', 'down', 'left', 'right'];
+    const action  = _argmax(outputs);
+    return { outputs, action, actionName: ACTIONS[action] };
+  }
+  return { outputs };
+}
+
 function getHostIp() {
   const ifaces = os.networkInterfaces();
   for (const name of Object.keys(ifaces)) {
@@ -275,7 +345,9 @@ class ApiServer extends EventEmitter {
           const payload = body ? JSON.parse(body) : {};
           const freshNet = this.storage.getNetwork(id);
           if (!freshNet || !freshNet.state) throw new Error('Model no longer available');
-          const result = infer(freshNet, payload);
+          const result = freshNet.architecture && freshNet.architecture.pluginKind
+            ? pluginPredict(freshNet, payload)
+            : infer(freshNet, payload);
           res.end(JSON.stringify(result));
           this.emit('log', { id, line: `POST /predict ok` });
           metrics.record('/predict', Date.now() - t0, false);
@@ -386,6 +458,47 @@ class ApiServer extends EventEmitter {
 
   _inputSpec(net) {
     const a = net.architecture;
+    if (a.pluginKind === 'self-driving-car') {
+      return {
+        type: 'plugin', pluginKind: 'self-driving-car',
+        field: 'inputs', length: 11,
+        inputDescription: [
+          'ray[0..8]: 9 sensor distances (0=wall, 1=clear), angles −80° to +80°',
+          'inputs[9]: normalised speed (0–1)',
+          'inputs[10]: normalised heading angle (0–1)',
+        ],
+        outputFields: { steer: '−1 to 1', throttle: '−1 to 1', outputs: 'raw logits [2]' },
+      };
+    }
+    if (a.pluginKind === 'snake-neuro') {
+      return {
+        type: 'plugin', pluginKind: 'snake-neuro',
+        field: 'inputs', length: 255,
+        inputDescription: [
+          '15×17 grid (row-major): 0=empty, 1=apple, 0.5=head, 0.25=body, −0.5=tail',
+        ],
+        outputFields: { direction: '0–3 index', directionName: 'up|right|down|left', outputs: 'raw logits [4]' },
+      };
+    }
+    if (a.pluginKind === 'warehouse-robot') {
+      const nBoxes = net.state && net.state.arch
+        ? Math.round((net.state.arch.inputDim - 5) / 6)
+        : Math.round((a.inputDim - 5) / 6);
+      return {
+        type: 'plugin', pluginKind: 'warehouse-robot',
+        field: 'inputs', length: a.inputDim,
+        nBoxes,
+        inputDescription: [
+          'inputs[0..1]: robot [row, col] normalised 0–1',
+          'inputs[2]: carrying flag (0 or 1)',
+          'inputs[3..3+nBoxes*2−1]: box positions [row, col] × nBoxes',
+          'inputs[next nBoxes*2]: target positions [row, col] × nBoxes',
+          'inputs[next nBoxes*2]: box→target offsets × nBoxes',
+          'inputs[last 2]: robot→nearest goal offset [dr, dc]',
+        ],
+        outputFields: { action: '0–3 index', actionName: 'up|down|left|right', outputs: 'raw Q-values [4]' },
+      };
+    }
     if (a.kind === 'classifier' || a.kind === 'mlp') return { type: 'vector', length: a.inputDim };
     if (a.kind === 'regressor') return { type: 'vector', length: a.inputDim, outputLength: a.outputDim };
     if (a.kind === 'charLM' || a.kind === 'gpt') {

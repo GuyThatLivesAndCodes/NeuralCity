@@ -47,6 +47,7 @@ function makeSession() {
     genHistory:   [],
     genStartTime: 0,
     inferSnake:   null,
+    arch:         null,
   };
 }
 
@@ -301,6 +302,12 @@ module.exports = function ({ storage } = {}) {
         const s  = getSession(id);
         const mutStd = opts.mutStd || 0.05;
 
+        s.arch = {
+          ...ARCH,
+          hidden:     Array.isArray(opts.hidden) && opts.hidden.length ? opts.hidden : ARCH.hidden,
+          activation: opts.activation || ARCH.activation,
+        };
+
         // Resume from saved state when available; fall back to fresh population.
         const savedPop = loadPopFromStorage(storage, id);
         if (savedPop) {
@@ -315,7 +322,7 @@ module.exports = function ({ storage } = {}) {
           }));
         } else {
           s.pop = new Population({
-            architecture: ARCH,
+            architecture: s.arch,
             size:         POP_SIZE,
             eliteCount:   2,
             pMutate:      0.15,
@@ -364,7 +371,7 @@ module.exports = function ({ storage } = {}) {
         if (!Population || !T) return { error: 'Engine unavailable.' };
 
         s.pop = new Population({
-          architecture: ARCH,
+          architecture: s.arch || ARCH,
           size:        POP_SIZE,
           eliteCount:  2,
           pMutate:     0.15,

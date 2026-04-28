@@ -1450,6 +1450,117 @@ function renderInferenceResult(r) {
 }
 
 // API tab
+// ── Plugin API documentation blocks ──────────────────────────────────────────
+function pluginApiDocs(arch, url) {
+  const base = url || 'http://HOST:PORT';
+  const pre  = (s) => `<pre style="background:#0d0d0d;border:1px solid #2a2a2a;border-radius:4px;padding:10px 12px;font-size:11px;line-height:1.6;overflow-x:auto;white-space:pre-wrap;word-break:break-all;">${escapeHtml(s)}</pre>`;
+  const dim  = (s) => `<span style="color:#555;">${s}</span>`;
+
+  if (arch.pluginKind === 'self-driving-car') {
+    const ex = JSON.stringify({ inputs: [1,1,1,0.6,1,0.4,1,1,1, 0.35, 0.08] });
+    return `
+      <div class="section">
+        <h3>Self-Driving Car — API Reference</h3>
+        <p style="font-size:12px;color:#888;margin:0 0 12px;">
+          Send 11 raw sensor floats, receive steering and throttle commands from the best evolved brain.
+          The model must be saved (pause training) before the server can start.
+        </p>
+
+        <h4 style="font-size:12px;color:#aaa;margin:14px 0 6px;">POST /predict</h4>
+        <div class="kv-table" style="margin-bottom:8px;">
+          <div class="k" style="color:#64b5f6;">inputs[0–8]</div><div>9 ray-cast distances (0.0 = wall ahead, 1.0 = clear), evenly spaced −80° → +80° relative to heading</div>
+          <div class="k" style="color:#64b5f6;">inputs[9]</div><div>Normalised speed  ${dim('(current_speed / 340)')}</div>
+          <div class="k" style="color:#64b5f6;">inputs[10]</div><div>Normalised heading angle  ${dim('(angle / 2π)')}</div>
+        </div>
+        <b style="font-size:11px;color:#666;">Request</b>
+        ${pre(`curl -s -X POST ${base}/predict \\
+  -H "Content-Type: application/json" \\
+  -d '${ex}'`)}
+        <b style="font-size:11px;color:#666;">Response</b>
+        ${pre(`{ "steer": 0.14, "throttle": 0.82, "outputs": [0.14, 0.82] }`)}
+        <div class="kv-table" style="margin-top:6px;">
+          <div class="k" style="color:#a5d6a7;">steer</div><div>−1.0 (full left) → 1.0 (full right), tanh-clamped</div>
+          <div class="k" style="color:#a5d6a7;">throttle</div><div>−1.0 (full brake) → 1.0 (full throttle), tanh-clamped</div>
+        </div>
+      </div>`;
+  }
+
+  if (arch.pluginKind === 'snake-neuro') {
+    const grid = new Array(255).fill(0); grid[127] = 0.5; grid[142] = 0.25; grid[157] = -0.5; grid[60] = 1.0;
+    const ex = JSON.stringify({ inputs: grid });
+    return `
+      <div class="section">
+        <h3>Snake (Neuroevolution) — API Reference</h3>
+        <p style="font-size:12px;color:#888;margin:0 0 12px;">
+          Send the 15×17 grid occupancy map, receive the next move from the best evolved snake brain.
+          The model must be saved (pause training) before the server can start.
+        </p>
+
+        <h4 style="font-size:12px;color:#aaa;margin:14px 0 6px;">POST /predict</h4>
+        <div class="kv-table" style="margin-bottom:8px;">
+          <div class="k" style="color:#64b5f6;">inputs</div><div>255 floats — 15×17 grid, row-major (y × GRID_W + x)</div>
+          <div class="k" style="color:#64b5f6;">0.0</div><div>Empty cell</div>
+          <div class="k" style="color:#64b5f6;">1.0</div><div>Apple</div>
+          <div class="k" style="color:#64b5f6;">0.5</div><div>Snake head</div>
+          <div class="k" style="color:#64b5f6;">0.25</div><div>Snake body</div>
+          <div class="k" style="color:#64b5f6;">−0.5</div><div>Snake tail</div>
+        </div>
+        <b style="font-size:11px;color:#666;">Request</b>
+        ${pre(`curl -s -X POST ${base}/predict \\
+  -H "Content-Type: application/json" \\
+  -d '{"inputs": [0,0,...,0.5,...,0.25,...,-0.5,...,1.0,...,0]}'
+# inputs is a flat array of 255 values`)}
+        <b style="font-size:11px;color:#666;">Response</b>
+        ${pre(`{ "direction": 1, "directionName": "right", "outputs": [-0.3, 1.1, 0.2, -0.8] }`)}
+        <div class="kv-table" style="margin-top:6px;">
+          <div class="k" style="color:#a5d6a7;">direction</div><div>0 = up · 1 = right · 2 = down · 3 = left</div>
+          <div class="k" style="color:#a5d6a7;">directionName</div><div>Human-readable direction string</div>
+          <div class="k" style="color:#a5d6a7;">outputs</div><div>Raw logits [4] — argmax gives the chosen direction</div>
+        </div>
+      </div>`;
+  }
+
+  if (arch.pluginKind === 'warehouse-robot') {
+    const nBoxes = Math.round((arch.inputDim - 5) / 6) || 1;
+    const dim_   = 5 + nBoxes * 6;
+    const ex = JSON.stringify({ inputs: new Array(dim_).fill(0).map(() => +(Math.random().toFixed(3))) });
+    return `
+      <div class="section">
+        <h3>Warehouse Robot (DQN) — API Reference</h3>
+        <p style="font-size:12px;color:#888;margin:0 0 12px;">
+          Send the robot's encoded state, receive the next action from the trained DQN policy.
+          This model was trained with <b style="color:#ccc;">${nBoxes} box${nBoxes > 1 ? 'es' : ''}</b>
+          so inputs must be <b style="color:#ccc;">${dim_} floats</b>.
+          The model must be saved (pause training) before the server can start.
+        </p>
+
+        <h4 style="font-size:12px;color:#aaa;margin:14px 0 6px;">POST /predict — Input layout (${dim_} floats)</h4>
+        <div class="kv-table" style="margin-bottom:8px;">
+          <div class="k" style="color:#64b5f6;">[0–1]</div><div>Robot position [row, col] normalised to 0–1 on an 8×8 grid</div>
+          <div class="k" style="color:#64b5f6;">[2]</div><div>Carrying flag: 1.0 if holding a box, 0.0 otherwise</div>
+          <div class="k" style="color:#64b5f6;">[3–${2+nBoxes*2}]</div><div>Box positions [row, col] × ${nBoxes} (normalised)</div>
+          <div class="k" style="color:#64b5f6;">[${3+nBoxes*2}–${2+nBoxes*4}]</div><div>Target positions [row, col] × ${nBoxes} (normalised)</div>
+          <div class="k" style="color:#64b5f6;">[${3+nBoxes*4}–${2+nBoxes*6}]</div><div>Box→target offset [Δrow, Δcol] × ${nBoxes}</div>
+          <div class="k" style="color:#64b5f6;">[${3+nBoxes*6}–${4+nBoxes*6}]</div><div>Robot→nearest goal offset [Δrow, Δcol]</div>
+        </div>
+        <b style="font-size:11px;color:#666;">Request</b>
+        ${pre(`curl -s -X POST ${base}/predict \\
+  -H "Content-Type: application/json" \\
+  -d '{"inputs": [0.125, 0.25, 0, 0.5, 0.5, 0.875, 0.875, 0.375, 0.375, 0.75, 0.75]}'
+# Example for 1-box config (11 inputs total)`)}
+        <b style="font-size:11px;color:#666;">Response</b>
+        ${pre(`{ "action": 0, "actionName": "up", "outputs": [2.1, 0.4, -0.3, 0.8] }`)}
+        <div class="kv-table" style="margin-top:6px;">
+          <div class="k" style="color:#a5d6a7;">action</div><div>0 = up · 1 = down · 2 = left · 3 = right</div>
+          <div class="k" style="color:#a5d6a7;">actionName</div><div>Human-readable action string</div>
+          <div class="k" style="color:#a5d6a7;">outputs</div><div>Raw Q-values [4] — argmax gives the greedy action</div>
+        </div>
+      </div>`;
+  }
+
+  return '';
+}
+
 async function renderApiPanel() {
   const root = $('#content');
   const allActive = await window.nb.api.list();
@@ -1458,13 +1569,33 @@ async function renderApiPanel() {
     root.innerHTML = `<div class="empty"><div class="big">No network selected</div></div>`;
     return;
   }
-  const n = state.current;
-  const info = await window.nb.system.info();
+  const n       = state.current;
+  const info    = await window.nb.system.info();
   const running = state.apiServers.get(n.id);
+  const arch    = n.architecture || {};
+  const isPlugin = !!arch.pluginKind;
+  const serverUrl = running ? running.url : 'http://' + info.hostIp + ':PORT';
+
+  const standardEndpoints = isPlugin ? `
+    <div class="kv-table">
+      <div class="k">GET</div><div>/health — liveness check: <code>{"ok":true}</code></div>
+      <div class="k">GET</div><div>/info — model metadata, input spec, plugin kind</div>
+      <div class="k">POST</div><div>/predict — body: <code>{"inputs":[…]}</code> → plugin-specific response</div>
+      <div class="k">GET</div><div>/metrics — Prometheus-format request counters</div>
+    </div>` : `
+    <div class="kv-table">
+      <div class="k">GET</div><div>/health — liveness check: <code>{"ok":true}</code></div>
+      <div class="k">GET</div><div>/info — network metadata and input spec</div>
+      <div class="k">POST</div><div>/predict — body matches the Inference tab shape</div>
+      ${arch.isChat ? `<div class="k">POST</div><div>/chat — stateful chat (sessionId in body, or omit to start new)</div>
+      <div class="k">POST</div><div>/chat/reset — clear a session: <code>{"sessionId":"…"}</code></div>` : ''}
+      <div class="k">GET</div><div>/metrics — Prometheus-format request counters</div>
+    </div>`;
+
   root.innerHTML = `
     <div class="panel">
       <h2>API — ${escapeHtml(n.name)}</h2>
-      <p class="hint">Expose this model on your local network. Other devices can call it at the URL below.</p>
+      <p class="hint">Expose this model on your local network. Other devices can call it at the URL below.${isPlugin ? ' Save the model first (pause training) so the server has weights to serve.' : ''}</p>
       <div class="section">
         <h3>Status</h3>
         <div class="kpis">
@@ -1484,11 +1615,9 @@ async function renderApiPanel() {
       </div>
       <div class="section">
         <h3>Endpoints</h3>
-        <div class="kv-table">
-          <div class="k">GET</div><div>/info — network metadata</div>
-          <div class="k">POST</div><div>/predict — body is the same shape as the Inference tab</div>
-        </div>
+        ${standardEndpoints}
       </div>
+      ${isPlugin ? pluginApiDocs(arch, serverUrl) : ''}
       <div class="section">
         <h3>Log</h3>
         <div class="log" id="api-log"></div>
@@ -1499,6 +1628,7 @@ async function renderApiPanel() {
   const startBtn = $('#btn-start-api');
   if (startBtn) startBtn.addEventListener('click', async () => {
     if (n.stateLocked) { toast('Decrypt the network first.'); return; }
+    if (isPlugin && !n.state) { toast('Pause training first to save the model, then start the server.'); return; }
     const port = parseInt($('#api-port').value) || 0;
     try {
       const r = await window.nb.api.start(n.id, port);

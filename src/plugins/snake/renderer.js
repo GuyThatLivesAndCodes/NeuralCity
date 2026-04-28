@@ -317,6 +317,9 @@
     const t          = (network && network.training) || {};
     const cfgMutStd  = t.learningRate || 0.08;
     const cfgSeed    = (t.seed | 0) || 42;
+    const a          = (network && network.architecture) || {};
+    const cfgHidden  = Array.isArray(a.hidden) && a.hidden.length ? a.hidden : [255, 128, 64];
+    const cfgActivation = a.activation || 'tanh';
 
     root.innerHTML = `
       <div class="panel" style="max-width:1080px;">
@@ -427,7 +430,7 @@
 
     async function startSim() {
       if (!_initialized) {
-        const r = await inv('snake-neuro:init', { seed: cfgSeed, mutStd: cfgMutStd });
+        const r = await inv('snake-neuro:init', { seed: cfgSeed, mutStd: cfgMutStd, hidden: cfgHidden, activation: cfgActivation });
         if (r && r.error) { console.error('[snake-neuro]', r.error); return; }
         _initialized = true;
       } else {

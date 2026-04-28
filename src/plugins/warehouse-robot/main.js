@@ -239,9 +239,37 @@ function gaussRand() {
   return Math.sqrt(-2 * Math.log(u + 1e-9)) * Math.cos(2 * Math.PI * v);
 }
 
-// ── IPC handlers ──────────────────────────────────────────────────────────────
-module.exports = {
-  mainHandlers: {
+// ── Storage helpers ───────────────────────────────────────────────────────────
+
+function saveAgentToStorage(storage, id, s) {
+  if (!storage || !s.agent) return;
+  try {
+    const agentJson = s.agent.toJSON();
+    // Preserve pluginKind when updating the stored architecture.
+    const architecture = { ...agentJson.arch, pluginKind: 'warehouse-robot' };
+    storage.saveTrainedState(id, { state: agentJson, architecture });
+  } catch (e) {
+    console.warn('[warehouse-robot] Could not save state:', e.message);
+  }
+}
+
+function loadAgentFromStorage(storage, id) {
+  if (!storage || !_DQNAgent) return null;
+  try {
+    const net = storage.getNetwork(id);
+    if (!net || !net.state || net.stateLocked) return null;
+    // State must look like a DQN snapshot (has onlineState).
+    if (!net.state.onlineState) return null;
+    return _DQNAgent.fromJSON(net.state);
+  } catch (e) {
+    console.warn('[warehouse-robot] Could not load state:', e.message);
+    return null;
+  }
+}
+
+// ── IPC handlers (factory — receives storage from plugin-loader) ──────────────
+module.exports = function ({ storage } = {}) {
+  return { mainHandlers: {
     'warehouse-robot:init': (_, opts = {}) => {
       if (!_DQNAgent) return { error: 'DQNAgent module unavailable — check app bundle.' };
       const id = opts.instanceId || 'default';
@@ -250,21 +278,30 @@ module.exports = {
       s.nBoxes = Math.max(1, Math.min(5, (opts.nBoxes | 0) || 1));
       const obstacles = generateObstacles(opts.seed || 42);
 
-      s.agent = new _DQNAgent({
-        architecture: {
-          kind: 'classifier',
-          inputDim: computeStateDim(s.nBoxes), outputDim: N_ACTIONS,
-          hidden: [128, 64], activation: 'relu', dropout: 0,
-        },
-        gamma: 0.95,
-        lr: opts.lr || opts.learningRate || 1e-3,
-        batchSize:      opts.batchSize || 64,
-        bufferCapacity: 5000,
-        epsilonStart: 1.0, epsilonEnd: 0.05, epsilonDecay: 0.999,
-        targetUpdateFreq: 200,
-        seed: opts.seed || 42,
-        optimizer: 'adam',
-      });
+      // Resume from saved state when available (nBoxes must match).
+      const savedAgent = loadAgentFromStorage(storage, id);
+      if (savedAgent && savedAgent.arch && savedAgent.arch.inputDim === computeStateDim(s.nBoxes)) {
+        s.agent       = savedAgent;
+        s.agent.epsilon = Math.min(savedAgent.epsilon, 0.15); // cap epsilon for resumed training
+      } else {
+        const hidden = Array.isArray(opts.hidden) && opts.hidden.length ? opts.hidden : [128, 64];
+        const activation = opts.activation || 'relu';
+        s.agent = new _DQNAgent({
+          architecture: {
+            kind: 'classifier',
+            inputDim: computeStateDim(s.nBoxes), outputDim: N_ACTIONS,
+            hidden, activation, dropout: 0,
+          },
+          gamma: 0.95,
+          lr: opts.lr || opts.learningRate || 1e-3,
+          batchSize:      opts.batchSize || 64,
+          bufferCapacity: 5000,
+          epsilonStart: 1.0, epsilonEnd: 0.05, epsilonDecay: 0.999,
+          targetUpdateFreq: 200,
+          seed: opts.seed || 42,
+          optimizer: 'adam',
+        });
+      }
 
       s.env          = resetEpisode(s.nBoxes, obstacles);
       s.running      = true;
@@ -273,7 +310,7 @@ module.exports = {
       s.totalSteps   = 0;
       s.bestReward   = -Infinity;
       s.rewardHistory = [];
-      return { ok: true, grid: GRID, nBoxes: s.nBoxes };
+      return { ok: true, grid: GRID, nBoxes: s.nBoxes, resumed: !!(savedAgent) };
     },
 
     'warehouse-robot:getState': (_, opts = {}) => {
@@ -319,7 +356,9 @@ module.exports = {
 
     'warehouse-robot:stop': (_, opts = {}) => {
       const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
-      getSession(id).running = false;
+      const s  = getSession(id);
+      s.running = false;
+      saveAgentToStorage(storage, id, s);
       return { ok: true };
     },
 
@@ -338,9 +377,50 @@ module.exports = {
       return { ok: true };
     },
 
+    // ── Save / load handlers ──────────────────────────────────────────────
+
+    'warehouse-robot:saveState': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      const s  = getSession(id);
+      if (!s.agent) return { error: 'No trained agent — run training first.' };
+      saveAgentToStorage(storage, id, s);
+      return { ok: true, episode: s.episode, bestReward: s.bestReward === -Infinity ? null : +s.bestReward.toFixed(2) };
+    },
+
+    'warehouse-robot:loadState': (_, opts = {}) => {
+      const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
+      const s  = getSession(id);
+      const agent = loadAgentFromStorage(storage, id);
+      if (!agent) return { error: 'No saved state found for this network.' };
+      s.agent     = agent;
+      s.nBoxes    = (agent.arch && agent.arch.inputDim
+        ? Math.round((agent.arch.inputDim - 5) / 6)
+        : s.nBoxes) || 1;
+      if (s.env) {
+        s.env = resetEpisode(s.nBoxes, s.env.obstacles || generateObstacles(42));
+      }
+      return { ok: true, nBoxes: s.nBoxes, epsilon: +agent.epsilon.toFixed(4) };
+    },
+
+    // ── Inference handlers ────────────────────────────────────────────────
+
     'warehouse-robot:inferInit': (_, opts = {}) => {
       const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
       const s  = getSession(id);
+
+      // Load from storage if no live session exists.
+      if (!s.agent && storage) {
+        const agent = loadAgentFromStorage(storage, id);
+        if (agent) {
+          s.agent  = agent;
+          s.nBoxes = (agent.arch && agent.arch.inputDim
+            ? Math.round((agent.arch.inputDim - 5) / 6)
+            : 1) || 1;
+          const obstacles = generateObstacles(42);
+          s.env = resetEpisode(s.nBoxes, obstacles);
+        }
+      }
+
       if (!s.agent) return { error: 'No trained agent — run training first.' };
       s.inferEnv      = resetEpisode(s.nBoxes, s.env.obstacles);
       s.inferEpReward = 0;
@@ -398,5 +478,5 @@ module.exports = {
         justReset,
       };
     },
-  },
+  }};
 };

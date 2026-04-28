@@ -177,6 +177,9 @@
     const cfgPopSize = (t.batchSize | 0) || 20;
     const cfgMutStd  = t.learningRate  || 0.05;
     const cfgGens    = (t.epochs  | 0) || 0;
+    const a          = (network && network.architecture) || {};
+    const cfgHidden  = Array.isArray(a.hidden) && a.hidden.length ? a.hidden : [64, 32, 16];
+    const cfgActivation = a.activation || 'tanh';
 
     root.innerHTML = `
       <div class="panel" style="max-width:960px;">
@@ -303,6 +306,7 @@
       if (!_initialized) {
         const r = await inv('self-driving-car:init', {
           seed: cfgSeed, popSize: cfgPopSize, mutStd: cfgMutStd, generations: cfgGens,
+          hidden: cfgHidden, activation: cfgActivation,
         });
         if (r && r.error) { console.error('[self-driving-car]', r.error); return; }
         _initialized = true;

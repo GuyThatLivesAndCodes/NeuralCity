@@ -219,6 +219,9 @@
     const cfgBS    = (t.batchSize | 0) || 64;
     const cfgSeed  = (t.seed || 42) >>> 0;
     const cfgBoxes = Math.max(1, Math.min(5, (t.workers | 0) || 1));
+    const a        = (network && network.architecture) || {};
+    const cfgHidden     = Array.isArray(a.hidden) && a.hidden.length ? a.hidden : [128, 64];
+    const cfgActivation = a.activation || 'relu';
 
     root.innerHTML = `
       <div class="panel" style="max-width:860px;">
@@ -308,7 +311,7 @@
 
     async function startSim() {
       if (!_initialized) {
-        const r = await inv('warehouse-robot:init', { lr: cfgLR, batchSize: cfgBS, seed: cfgSeed, nBoxes: cfgBoxes });
+        const r = await inv('warehouse-robot:init', { lr: cfgLR, batchSize: cfgBS, seed: cfgSeed, nBoxes: cfgBoxes, hidden: cfgHidden, activation: cfgActivation });
         if (r && r.error) { console.error('[warehouse-robot]', r.error); return; }
         _initialized = true;
       } else {

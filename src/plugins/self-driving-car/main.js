@@ -49,6 +49,7 @@ function makeSession() {
     generation: 0, bestFit: 0, genBestFit: 0,
     running: false, genHistory: [],
     inferCar: null, inferTrack: null,
+    arch: null,
   };
 }
 const _sessions = new Map();
@@ -347,6 +348,12 @@ module.exports = function ({ storage } = {}) {
         const seed   = (opts.seed || 0) >>> 0;
         const mutStd = Math.max(0.001, opts.mutStd || 0.05);
 
+        s.arch = {
+          ...ARCH,
+          hidden:     Array.isArray(opts.hidden) && opts.hidden.length ? opts.hidden : ARCH.hidden,
+          activation: opts.activation || ARCH.activation,
+        };
+
         s.track = generateTrack(seed || 0xC0FFEE);
 
         // Resume from saved state when available; fall back to fresh population.
@@ -363,7 +370,7 @@ module.exports = function ({ storage } = {}) {
           }));
         } else {
           s.pop = new Population({
-            architecture: ARCH,
+            architecture: s.arch,
             size: s.popSize,
             eliteCount: Math.max(1, Math.floor(s.popSize * 0.2)),
             pMutate: 0.15, mutationStd: mutStd,
@@ -424,7 +431,7 @@ module.exports = function ({ storage } = {}) {
         const seed = Math.floor(Math.random() * 0xFFFFFF);
         s.track = generateTrack(seed);
         s.pop   = new Population({
-          architecture: ARCH,
+          architecture: s.arch || ARCH,
           size: s.popSize,
           eliteCount: Math.max(1, Math.floor(s.popSize * 0.2)),
           pMutate: 0.15, mutationStd: 0.05,
