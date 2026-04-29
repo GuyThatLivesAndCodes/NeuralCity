@@ -112,6 +112,19 @@
       `<polyline points="${pts}" fill="none" stroke="#ffd600" stroke-width="1.5" stroke-linejoin="round"/>`;
   }
 
+  // ── Architecture fields ───────────────────────────────────────────────────
+  api.registerArchFields('self-driving-car', {
+    fields: [
+      { id: 'numRays',       label: 'Sensor rays',                type: 'number',     default: 9,     min: 3,  max: 25,  step: 1, hint: 'Number of ray-cast sensors spread across the field of view. Changing this resets saved weights.' },
+      { id: 'sensorFov',     label: 'Sensor FOV (°)',             type: 'number',     default: 160,   min: 30, max: 360, step: 5, hint: 'Total angular field of view covered by sensors (symmetric around heading)' },
+      { id: 'maxRayDist',    label: 'Max ray range (px)',         type: 'number',     default: 40,    min: 10, max: 200, step: 5, hint: 'Maximum distance a sensor ray travels before returning 1.0 (clear)' },
+      { id: 'debugRaycasts', label: 'Visualise raycasts (Infer)', type: 'boolean',    default: false,                            hint: 'Draw each sensor ray on the Infer tab canvas' },
+      { id: 'hidden',        label: 'Hidden layers',              type: 'layers',     default: [64, 32, 16],                    hint: 'Comma-separated hidden layer sizes. Changing these resets saved weights.' },
+      { id: 'activation',    label: 'Activation',                 type: 'activation', default: 'tanh' },
+    ],
+    computeDims: (a) => ({ inputDim: (a.numRays || 9) + 2, outputDim: 2 }),
+  });
+
   // ── Template ──────────────────────────────────────────────────────────────
   api.registerTemplate({
     id: 'self-driving-car',
@@ -123,6 +136,7 @@
       kind: 'classifier', pluginKind: 'self-driving-car',
       inputDim: 11, outputDim: 2,
       hidden: [64, 32, 16], activation: 'tanh', dropout: 0,
+      numRays: 9, sensorFov: 160, maxRayDist: 40, debugRaycasts: false,
     },
     training: { optimizer: 'adam', learningRate: 0.05, batchSize: 20, epochs: 0, seed: 42, workers: 0 },
     trainingData: {},
@@ -140,7 +154,12 @@
   });
 
   // ── Train editor (training data section) ──────────────────────────────────
-  api.registerTrainEditor('self-driving-car', function (root) {
+  api.registerTrainEditor('self-driving-car', function (root, network) {
+    const a = (network && network.architecture) || {};
+    const numRays = a.numRays || 9;
+    const fov     = a.sensorFov || 160;
+    const hidden  = (a.hidden || [64, 32, 16]).join(', ');
+    const inputDim = numRays + 2;
     root.innerHTML = `
       <div style="display:grid;gap:10px;">
         <div style="background:#1a1a00;border:1px solid #4a4a00;border-radius:6px;padding:10px 14px;">
@@ -152,11 +171,12 @@
           </div>
         </div>
         <div style="font-size:12px;color:#666;background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:8px 12px;line-height:1.6;">
-          Architecture: <strong style="color:#aaa;">11 → [64, 32, 16] → 2</strong><br>
-          Inputs: 9 sensor rays (±80°) · normalised speed · orientation<br>
+          Network: <strong style="color:#aaa;">${inputDim} → [${hidden}] → 2</strong><br>
+          Inputs: ${numRays} sensor rays (±${fov/2}°) · normalised speed · heading<br>
           Outputs: steer (tanh) · throttle/brake (tanh)<br><br>
+          Sensor and network settings live in the <strong style="color:#ccc;">Editor</strong> tab → Architecture.<br>
           Use the <strong style="color:#ccc;">Train</strong> tab to run the live evolution.<br>
-          The <strong style="color:#ccc;">Infer</strong> tab shows the best evolved car with a noise slider.
+          The <strong style="color:#ccc;">Infer</strong> tab shows the best evolved car with optional raycast overlay.
         </div>
       </div>
     `;
@@ -172,14 +192,18 @@
     const instanceId = (network && network.id) || 'car-default';
     const inv = (ch, extra = {}) => nb.invoke(ch, { instanceId, ...extra });
 
-    const t          = (network && network.training) || {};
-    const cfgSeed    = (t.seed    || 42) >>> 0;
-    const cfgPopSize = (t.batchSize | 0) || 20;
-    const cfgMutStd  = t.learningRate  || 0.05;
-    const cfgGens    = (t.epochs  | 0) || 0;
-    const a          = (network && network.architecture) || {};
-    const cfgHidden  = Array.isArray(a.hidden) && a.hidden.length ? a.hidden : [64, 32, 16];
-    const cfgActivation = a.activation || 'tanh';
+    const t             = (network && network.training) || {};
+    const cfgSeed       = (t.seed    || 42) >>> 0;
+    const cfgPopSize    = (t.batchSize | 0) || 20;
+    const cfgMutStd     = t.learningRate  || 0.05;
+    const cfgGens       = (t.epochs  | 0) || 0;
+    const a             = (network && network.architecture) || {};
+    const cfgHidden     = Array.isArray(a.hidden) && a.hidden.length ? a.hidden : [64, 32, 16];
+    const cfgActivation = a.activation   || 'tanh';
+    const cfgNumRays    = (a.numRays    | 0) || 9;
+    const cfgFov        = a.sensorFov    || 160;
+    const cfgRayDist    = a.maxRayDist   || 40;
+    const cfgDebugRays  = !!a.debugRaycasts;
 
     root.innerHTML = `
       <div class="panel" style="max-width:960px;">
@@ -197,7 +221,6 @@
             <div class="row" style="margin-top:10px;gap:8px;flex-wrap:wrap;">
               <button class="btn primary" id="car-start">Start</button>
               <button class="btn"         id="car-pause">Pause</button>
-              <button class="btn"         id="car-reset">New evolution</button>
               <button class="btn"         id="car-newtrack">New track</button>
             </div>
             <div style="margin-top:8px;display:flex;align-items:center;gap:8px;font-size:12px;color:#666;">
@@ -230,7 +253,7 @@
               <strong style="color:#666;">Fitness</strong> = laps + (segments / track_N)<br>
               + speed bonus · × survival factor<br><br>
               Population: ${cfgPopSize} · Mutation std: ${cfgMutStd}<br>
-              Sensors: 9 rays (±80°) · max range 40 px<br>
+              Sensors: ${cfgNumRays} rays (±${Math.round(cfgFov/2)}°) · max range ${cfgRayDist} px<br>
               Max episode: ${30 * 18} frames (~18 s)
             </div>
 
@@ -307,6 +330,8 @@
         const r = await inv('self-driving-car:init', {
           seed: cfgSeed, popSize: cfgPopSize, mutStd: cfgMutStd, generations: cfgGens,
           hidden: cfgHidden, activation: cfgActivation,
+          numRays: cfgNumRays, sensorFov: cfgFov, maxRayDist: cfgRayDist,
+          debugRaycasts: cfgDebugRays,
         });
         if (r && r.error) { console.error('[self-driving-car]', r.error); return; }
         _initialized = true;
@@ -322,23 +347,6 @@
       _running = false;
       inv('self-driving-car:stop');
       if (_raf) { cancelAnimationFrame(_raf); _raf = null; }
-    }
-
-    async function resetSim() {
-      pauseSim();
-      await inv('self-driving-car:reset');
-      _initialized = true;
-      _cachedTrack = null;
-      ctx.clearRect(0, 0, CW, CH);
-      ctx.fillStyle = COL.bg;
-      ctx.fillRect(0, 0, CW, CH);
-      ['car-gen', 'car-alive', 'car-genbest', 'car-best'].forEach(id => {
-        const el = document.getElementById(id);
-        if (!el) return;
-        el.textContent = id === 'car-alive' ? `0 / ${cfgPopSize}` : id === 'car-gen' ? '0' : '—';
-      });
-      const svg = document.getElementById('car-chart');
-      if (svg) svg.innerHTML = '';
     }
 
     async function newTrack() {
@@ -358,7 +366,6 @@
 
     document.getElementById('car-start').addEventListener('click', startSim);
     document.getElementById('car-pause').addEventListener('click', pauseSim);
-    document.getElementById('car-reset').addEventListener('click', resetSim);
     document.getElementById('car-newtrack').addEventListener('click', newTrack);
 
     const slider = document.getElementById('car-speed');
@@ -386,14 +393,16 @@
     let _cachedTrack = null;
     let _noiseStd    = 0;
 
-    const instanceId = (network && network.id) || 'car-default';
-    const inv = (ch, extra = {}) => nb.invoke(ch, { instanceId, ...extra });
+    const instanceId     = (network && network.id) || 'car-default';
+    const inv            = (ch, extra = {}) => nb.invoke(ch, { instanceId, ...extra });
+    const ia             = (network && network.architecture) || {};
+    const cfgDebugRays   = !!ia.debugRaycasts;
 
     root.innerHTML = `
       <div class="panel" style="max-width:960px;">
         <h2>Self-Driving Car — Best Model</h2>
         <p style="font-size:12px;color:#777;margin:-4px 0 16px;">
-          The best genome found so far drives the track. Add sensor noise to stress-test robustness.
+          The best genome found so far drives the track. Add sensor noise to stress-test robustness.${cfgDebugRays ? ' Raycast overlay is <strong style="color:#ffd600;">ON</strong> — toggle in Editor → Architecture.' : ''}
         </p>
 
         <div style="display:grid;grid-template-columns:${CW}px 1fr;gap:20px;align-items:start;">
@@ -426,7 +435,7 @@
                 <span id="car-i-noise-val" style="min-width:36px;text-align:right;color:#ffd600;">0.00</span>
               </div>
               <div style="font-size:11px;color:#555;margin-top:4px;">
-                Gaussian noise std added to each of the 9 sensor readings. Drag right to stress-test.
+                Gaussian noise std added to each sensor reading. Drag right to stress-test robustness.
               </div>
             </div>
 
@@ -468,6 +477,25 @@
       drawTrackOn(ctx, track);
 
       if (!s || !s.car) return;
+
+      // Raycast overlay (when debugRaycasts is enabled)
+      if (s.rays && s.rays.length) {
+        for (const ray of s.rays) {
+          ctx.beginPath();
+          ctx.moveTo(s.car.x, s.car.y);
+          ctx.lineTo(ray.x, ray.y);
+          ctx.strokeStyle = ray.hit ? '#ff572299' : '#00e67644';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          if (ray.hit) {
+            ctx.fillStyle = '#ff5722cc';
+            ctx.beginPath();
+            ctx.arc(ray.x, ray.y, 2.5, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+      }
+
       drawCarOn(ctx, s.car, COL.carInfer, 1.0);
 
       // Speed bar along bottom edge

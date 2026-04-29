@@ -2,9 +2,7 @@
 (function (api) {
   'use strict';
 
-  const GRID = 8;
-  const CELL = 54;
-  const CW   = GRID * CELL;  // 432
+  const CANVAS_SIZE = 432;   // fixed canvas size; cell size is computed from grid at render time
 
   // ── Palette ───────────────────────────────────────────────────────────────
   const COL = {
@@ -29,11 +27,14 @@
   // ── Shared drawing ────────────────────────────────────────────────────────
 
   function drawGridState(ctx, s, robotColor, robotHiColor) {
-    ctx.clearRect(0, 0, CW, CW);
+    const gridN = (s && s.grid) || 8;
+    const CELL  = Math.floor(CANVAS_SIZE / gridN);
+
+    ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
 
     // Floor
-    for (let r = 0; r < GRID; r++) {
-      for (let c = 0; c < GRID; c++) {
+    for (let r = 0; r < gridN; r++) {
+      for (let c = 0; c < gridN; c++) {
         ctx.fillStyle = COL.bg;
         ctx.fillRect(c * CELL, r * CELL, CELL, CELL);
         ctx.strokeStyle = COL.gridLine;
@@ -44,6 +45,8 @@
 
     if (!s) return;
 
+    const hatch = Math.max(4, Math.round(CELL * 0.15));
+
     // Obstacles
     for (const [or, oc] of (s.obstacles || [])) {
       ctx.fillStyle = COL.obstacle;
@@ -52,13 +55,13 @@
       ctx.lineWidth = 1;
       ctx.strokeRect(oc * CELL + 1, or * CELL + 1, CELL - 2, CELL - 2);
       ctx.strokeStyle = COL.obstacleHatch;
-      ctx.lineWidth = 2.5;
+      ctx.lineWidth = 2;
       ctx.lineCap = 'round';
       ctx.beginPath();
-      ctx.moveTo(oc * CELL + 8, or * CELL + 8);
-      ctx.lineTo(oc * CELL + CELL - 8, or * CELL + CELL - 8);
-      ctx.moveTo(oc * CELL + CELL - 8, or * CELL + 8);
-      ctx.lineTo(oc * CELL + 8, or * CELL + CELL - 8);
+      ctx.moveTo(oc * CELL + hatch, or * CELL + hatch);
+      ctx.lineTo(oc * CELL + CELL - hatch, or * CELL + CELL - hatch);
+      ctx.moveTo(oc * CELL + CELL - hatch, or * CELL + hatch);
+      ctx.lineTo(oc * CELL + hatch, or * CELL + CELL - hatch);
       ctx.stroke();
       ctx.lineCap = 'butt';
     }
@@ -77,20 +80,21 @@
       ctx.beginPath();
       ctx.arc(cx, cy, CELL * 0.32, 0, Math.PI * 2);
       ctx.stroke();
+      const tick = Math.max(4, Math.round(CELL * 0.14));
       if (done) {
         ctx.strokeStyle = COL.targetRingDone;
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(cx - 7, cy);
-        ctx.lineTo(cx - 2, cy + 6);
-        ctx.lineTo(cx + 8, cy - 7);
+        ctx.moveTo(cx - tick, cy);
+        ctx.lineTo(cx - Math.round(tick * 0.3), cy + tick * 0.9);
+        ctx.lineTo(cx + tick * 1.1, cy - tick);
         ctx.stroke();
       } else {
         ctx.strokeStyle = COL.targetRing;
         ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.moveTo(cx - 7, cy); ctx.lineTo(cx + 7, cy);
-        ctx.moveTo(cx, cy - 7); ctx.lineTo(cx, cy + 7);
+        ctx.moveTo(cx - tick, cy); ctx.lineTo(cx + tick, cy);
+        ctx.moveTo(cx, cy - tick); ctx.lineTo(cx, cy + tick);
         ctx.stroke();
       }
     }
@@ -99,18 +103,20 @@
     for (let i = 0; i < (s.boxes || []).length; i++) {
       if (deliveredMask[i] || s.carrying === i) continue;
       const [br, bc] = s.boxes[i];
-      const x = bc * CELL, y = br * CELL, pad = 9;
+      const pad = Math.max(3, Math.round(CELL * 0.17));
+      const x = bc * CELL, y = br * CELL;
       ctx.fillStyle   = COL.box;
       ctx.strokeStyle = COL.boxStroke;
       ctx.lineWidth   = 1.5;
       ctx.fillRect  (x + pad, y + pad, CELL - pad * 2, CELL - pad * 2);
       ctx.strokeRect(x + pad, y + pad, CELL - pad * 2, CELL - pad * 2);
       const mx = x + CELL / 2, my = y + CELL / 2;
+      const cross = Math.max(3, Math.round(CELL * 0.09));
       ctx.strokeStyle = '#ffcc80';
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(mx - 5, my - 5); ctx.lineTo(mx + 5, my + 5);
-      ctx.moveTo(mx + 5, my - 5); ctx.lineTo(mx - 5, my + 5);
+      ctx.moveTo(mx - cross, my - cross); ctx.lineTo(mx + cross, my + cross);
+      ctx.moveTo(mx + cross, my - cross); ctx.lineTo(mx - cross, my + cross);
       ctx.stroke();
     }
 
@@ -123,12 +129,13 @@
     ctx.fill();
     ctx.fillStyle = robotHiColor;
     ctx.beginPath();
-    ctx.arc(rx, ry, 4, 0, Math.PI * 2);
+    ctx.arc(rx, ry, Math.max(2, Math.round(CELL * 0.07)), 0, Math.PI * 2);
     ctx.fill();
 
-    // Carry indicator — small box in top-right corner of robot cell
+    // Carry indicator
     if (s.carrying >= 0) {
-      const pad = 5, sz = 13;
+      const pad = Math.max(3, Math.round(CELL * 0.09));
+      const sz  = Math.max(8, Math.round(CELL * 0.24));
       ctx.fillStyle   = COL.boxCarried;
       ctx.strokeStyle = COL.boxCarriedStr;
       ctx.lineWidth   = 1.5;
@@ -154,19 +161,32 @@
       `<polyline points="${pts}" fill="none" stroke="#4caf50" stroke-width="1.5" stroke-linejoin="round"/>`;
   }
 
+  // ── Architecture fields ───────────────────────────────────────────────────
+  api.registerArchFields('warehouse-robot', {
+    fields: [
+      { id: 'numBoxes',     label: 'Number of boxes', type: 'number',     default: 1,   min: 1, max: 5,  step: 1, hint: 'Boxes to pick up and deliver. Changing resets saved weights.' },
+      { id: 'gridSize',     label: 'Grid size (n×n)', type: 'number',     default: 8,   min: 4, max: 16, step: 1, hint: 'Size of the square grid' },
+      { id: 'numObstacles', label: 'Obstacles',       type: 'number',     default: 4,   min: 0, max: 20, step: 1, hint: 'Number of obstacle cells in the grid (seeded by env seed)' },
+      { id: 'hidden',       label: 'Hidden layers',   type: 'layers',     default: [128, 64], hint: 'Network hidden layer sizes. Changing resets saved weights.' },
+      { id: 'activation',   label: 'Activation',      type: 'activation', default: 'relu' },
+    ],
+    computeDims: (a) => ({ inputDim: 5 + (a.numBoxes || 1) * 6, outputDim: 4 }),
+  });
+
   // ── Template ──────────────────────────────────────────────────────────────
   api.registerTemplate({
     id: 'warehouse-robot',
     name: 'Warehouse Robot (Q-Learning)',
     kind: 'classifier',
     pluginKind: 'warehouse-robot',
-    desc: 'A DQN agent navigates an obstacle-filled 8×8 grid, picks up boxes, and delivers them to target squares. Set box count in Training settings.',
+    desc: 'A DQN agent navigates an obstacle-filled grid, picks up boxes, and delivers them to target squares. Grid size, box count, and obstacle count are all configurable.',
     arch: {
       kind: 'classifier', pluginKind: 'warehouse-robot',
-      inputDim: 11, outputDim: 4,   // default 1 box: 5 + 1×6 = 11
+      inputDim: 11, outputDim: 4,
       hidden: [128, 64], activation: 'relu', dropout: 0,
+      numBoxes: 1, gridSize: 8, numObstacles: 4,
     },
-    training: { optimizer: 'adam', learningRate: 0.001, batchSize: 64, epochs: 0, seed: 42, workers: 1 },
+    training: { optimizer: 'adam', learningRate: 0.001, batchSize: 64, epochs: 0, seed: 42, workers: 0 },
     trainingData: {},
   });
 
@@ -176,30 +196,34 @@
     bs:        { label: 'Batch size',    hint: 'Replay buffer sample size per training step (default 64)' },
     epochs:    { label: 'Max episodes',  hint: 'Training episode limit (0 = unlimited)' },
     seed:      { label: 'Env seed',      hint: 'Seed for obstacle layout — same seed = same obstacle grid' },
-    workers:   { label: 'Box count',     hint: 'Number of boxes to pick up and deliver (1–5, default 1)' },
+    workers:   { hidden: true },
     optimizer: { hidden: true },
     sectionHint: 'DQN hyperparameters — applied when the simulation starts.',
   });
 
   // ── Train editor ──────────────────────────────────────────────────────────
-  api.registerTrainEditor('warehouse-robot', function (root) {
+  api.registerTrainEditor('warehouse-robot', function (root, network) {
+    const a    = (network && network.architecture) || {};
+    const gN   = a.gridSize     || 8;
+    const nB   = a.numBoxes     || 1;
+    const nObs = a.numObstacles != null ? a.numObstacles : 4;
     root.innerHTML = `
       <div style="display:grid;gap:10px;">
         <div style="background:#0d2b0d;border:1px solid #2d5a2d;border-radius:6px;padding:10px 14px;">
-          <div style="font-size:13px;font-weight:600;color:#4caf50;margin-bottom:5px;">Q-Learning — no training data required</div>
+          <div style="font-size:13px;font-weight:600;color:#4caf50;margin-bottom:5px;">Q-Learning (DQN) — no training data required</div>
           <div style="font-size:12px;color:#aaa;line-height:1.6;">
-            A Deep Q-Network learns to navigate an obstacle-filled grid, pick up boxes, and deliver
-            them to target squares. The agent starts exploring randomly (ε = 1.0) and shifts to a
-            learned policy as epsilon decays to 0.05.
+            A Deep Q-Network learns to navigate a ${gN}×${gN} obstacle-filled grid, pick up
+            ${nB} box${nB > 1 ? 'es' : ''}, and deliver ${nB > 1 ? 'them' : 'it'} to target squares.
+            Agent starts exploring randomly (ε = 1.0) and shifts to learned policy as epsilon decays.
           </div>
         </div>
         <div style="font-size:12px;color:#666;background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:8px 12px;line-height:1.6;">
-          State: robot pos · carrying flag · box positions · target positions · relative offsets<br>
+          Grid: ${gN}×${gN} · Boxes: ${nB} · Obstacles: ${nObs}<br>
+          State: robot pos · carrying · box+target positions · relative offsets<br>
           Actions: UP / DOWN / LEFT / RIGHT<br>
-          Rewards: +1 pick up · +10 deliver · +50 all done<br>
-          &minus;0.5 wall · &minus;0.3 obstacle · &minus;0.01/step<br><br>
-          Obstacle layout is fixed per session (env seed). Box and target positions<br>
-          are randomised each episode. Set <strong style="color:#ccc;">Box count</strong> in Training settings.
+          Rewards: +1 pick up · +10 deliver · +50 all done · −0.5 wall · −0.3 obstacle<br><br>
+          Grid and box settings live in the <strong style="color:#ccc;">Editor</strong> tab → Architecture.<br>
+          Obstacle layout is seeded (same env seed = same obstacles).
         </div>
       </div>
     `;
@@ -214,28 +238,29 @@
     const instanceId = (network && network.id) || 'wh-default';
     const inv = (ch, extra = {}) => nb.invoke(ch, { instanceId, ...extra });
 
-    const t        = (network && network.training) || {};
-    const cfgLR    = t.learningRate || 0.001;
-    const cfgBS    = (t.batchSize | 0) || 64;
-    const cfgSeed  = (t.seed || 42) >>> 0;
-    const cfgBoxes = Math.max(1, Math.min(5, (t.workers | 0) || 1));
-    const a        = (network && network.architecture) || {};
+    const t             = (network && network.training) || {};
+    const cfgLR         = t.learningRate || 0.001;
+    const cfgBS         = (t.batchSize | 0) || 64;
+    const cfgSeed       = (t.seed || 42) >>> 0;
+    const a             = (network && network.architecture) || {};
     const cfgHidden     = Array.isArray(a.hidden) && a.hidden.length ? a.hidden : [128, 64];
-    const cfgActivation = a.activation || 'relu';
+    const cfgActivation = a.activation   || 'relu';
+    const cfgBoxes      = Math.max(1, Math.min(5,  (a.numBoxes     | 0) || 1));
+    const cfgGridSize   = Math.max(4, Math.min(16, (a.gridSize     | 0) || 8));
+    const cfgObstacles  = Math.max(0, a.numObstacles != null ? (a.numObstacles | 0) : 4);
 
     root.innerHTML = `
       <div class="panel" style="max-width:860px;">
         <h2>Warehouse Robot — Q-Learning</h2>
         <p style="font-size:12px;color:#777;margin:-4px 0 16px;">
-          DQN agent picks up ${cfgBoxes} box${cfgBoxes > 1 ? 'es' : ''} and delivers
-          ${cfgBoxes > 1 ? 'them' : 'it'} to target squares on an obstacle-filled 8×8 grid.
+          DQN agent picks up ${cfgBoxes} box${cfgBoxes > 1 ? 'es' : ''} on a ${cfgGridSize}×${cfgGridSize} grid.
           LR: ${cfgLR} · Batch: ${cfgBS} · ε decays 1.0 → 0.05.
         </p>
 
-        <div style="display:grid;grid-template-columns:${CW}px 1fr;gap:20px;align-items:start;">
+        <div style="display:grid;grid-template-columns:${CANVAS_SIZE}px 1fr;gap:20px;align-items:start;">
 
           <div>
-            <canvas id="wh-canvas" width="${CW}" height="${CW}"
+            <canvas id="wh-canvas" width="${CANVAS_SIZE}" height="${CANVAS_SIZE}"
               style="display:block;border:1px solid #2a2a2a;border-radius:4px;background:#111;"></canvas>
             <div class="row" style="margin-top:10px;gap:8px;flex-wrap:wrap;">
               <button class="btn primary" id="wh-start">Start</button>
@@ -311,7 +336,7 @@
 
     async function startSim() {
       if (!_initialized) {
-        const r = await inv('warehouse-robot:init', { lr: cfgLR, batchSize: cfgBS, seed: cfgSeed, nBoxes: cfgBoxes, hidden: cfgHidden, activation: cfgActivation });
+        const r = await inv('warehouse-robot:init', { lr: cfgLR, batchSize: cfgBS, seed: cfgSeed, nBoxes: cfgBoxes, hidden: cfgHidden, activation: cfgActivation, gridSize: cfgGridSize, numObstacles: cfgObstacles });
         if (r && r.error) { console.error('[warehouse-robot]', r.error); return; }
         _initialized = true;
       } else {
@@ -375,10 +400,10 @@
           The trained DQN runs greedy (ε = 0). Add state noise to stress-test robustness.
         </p>
 
-        <div style="display:grid;grid-template-columns:${CW}px 1fr;gap:20px;align-items:start;">
+        <div style="display:grid;grid-template-columns:${CANVAS_SIZE}px 1fr;gap:20px;align-items:start;">
 
           <div>
-            <canvas id="wh-i-canvas" width="${CW}" height="${CW}"
+            <canvas id="wh-i-canvas" width="${CANVAS_SIZE}" height="${CANVAS_SIZE}"
               style="display:block;border:1px solid #2a2a2a;border-radius:4px;background:#111;"></canvas>
             <div class="row" style="margin-top:10px;gap:8px;">
               <button class="btn primary" id="wh-i-start">Start</button>
@@ -435,7 +460,7 @@
       ctx.font         = '13px monospace';
       ctx.textAlign    = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(msg, CW / 2, CW / 2);
+      ctx.fillText(msg, CANVAS_SIZE / 2, CANVAS_SIZE / 2);
       ctx.textAlign    = 'left';
       ctx.textBaseline = 'alphabetic';
     }

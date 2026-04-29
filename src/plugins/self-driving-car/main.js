@@ -50,6 +50,8 @@ function makeSession() {
     running: false, genHistory: [],
     inferCar: null, inferTrack: null,
     arch: null,
+    numRays: 9, rayAngles: RAY_ANGLES, rayMax: RAY_MAX,
+    inputDim: INPUT_DIM, debugRaycasts: false,
   };
 }
 const _sessions = new Map();
@@ -132,12 +134,24 @@ function isOnTrack(x, y, track) {
   return false;
 }
 
-function castRay(cx, cy, angle, track) {
+function castRay(cx, cy, angle, track, rayMax) {
+  const rMax = rayMax || RAY_MAX;
   const dx = Math.cos(angle), dy = Math.sin(angle);
-  for (let d = RAY_STEP; d <= RAY_MAX; d += RAY_STEP) {
-    if (!isOnTrack(cx + dx * d, cy + dy * d, track)) return (d - RAY_STEP) / RAY_MAX;
+  for (let d = RAY_STEP; d <= rMax; d += RAY_STEP) {
+    if (!isOnTrack(cx + dx * d, cy + dy * d, track)) return d / rMax;
   }
   return 1.0;
+}
+
+function castRayEndpoint(cx, cy, angle, track, rayMax) {
+  const rMax = rayMax || RAY_MAX;
+  const dx = Math.cos(angle), dy = Math.sin(angle);
+  for (let d = RAY_STEP; d <= rMax; d += RAY_STEP) {
+    if (!isOnTrack(cx + dx * d, cy + dy * d, track)) {
+      return { x: cx + dx * (d - RAY_STEP), y: cy + dy * (d - RAY_STEP), hit: true };
+    }
+  }
+  return { x: cx + dx * rMax, y: cy + dy * rMax, hit: false };
 }
 
 function nearestSegIdx(x, y, track) {
@@ -166,11 +180,13 @@ function spawnCar(track) {
   };
 }
 
-function senseCar(car, track) {
-  const sensors = RAY_ANGLES.map(da => castRay(car.x, car.y, car.angle + da, track));
+function senseCar(car, track, s) {
+  const rayAngles = (s && s.rayAngles) || RAY_ANGLES;
+  const rayMax    = (s && s.rayMax)    || RAY_MAX;
+  const sensors   = rayAngles.map(da => castRay(car.x, car.y, car.angle + da, track, rayMax));
   sensors.push(car.speed / MAX_SPEED);
   sensors.push(car.angle / (2 * Math.PI));
-  return new Float32Array(sensors);  // length INPUT_DIM = 11
+  return new Float32Array(sensors);
 }
 
 function stepCar(car, steerOut, throttleOut) {
@@ -208,8 +224,9 @@ function carFitness(car, track) {
 
 // ── Neural net forward pass ───────────────────────────────────────────────────
 
-function netForward(model, inputArr) {
-  const x   = new T.Tensor([1, INPUT_DIM], inputArr, false);
+function netForward(model, inputArr, inputDim) {
+  const dim = inputDim || INPUT_DIM;
+  const x   = new T.Tensor([1, dim], inputArr, false);
   const out = model.forward(x, { training: false });
   return out.data;
 }
@@ -236,8 +253,8 @@ function stepGeneration(s, opts) {
       if (!car.alive) continue;
       allDead = false;
 
-      const inputs   = senseCar(car, s.track);
-      const outs     = netForward(s.pop.individuals[i], inputs);
+      const inputs   = senseCar(car, s.track, s);
+      const outs     = netForward(s.pop.individuals[i], inputs, s.inputDim);
       const steer    = Math.max(-1, Math.min(1, outs[0]));
       const throttle = Math.max(-1, Math.min(1, outs[1]));
 
@@ -311,7 +328,8 @@ function buildVisualState(s) {
 function savePopToStorage(storage, id, s) {
   if (!storage || !s.pop) return;
   try {
-    storage.saveTrainedState(id, { state: s.pop.toJSON(), architecture: ARCH });
+    const arch = { ...(s.arch || ARCH), pluginKind: 'self-driving-car' };
+    storage.saveTrainedState(id, { state: s.pop.toJSON(), architecture: arch });
   } catch (e) {
     console.warn('[self-driving-car] Could not save state:', e.message);
   }
@@ -348,17 +366,43 @@ module.exports = function ({ storage } = {}) {
         const seed   = (opts.seed || 0) >>> 0;
         const mutStd = Math.max(0.001, opts.mutStd || 0.05);
 
+        // Sensor config — derive from opts or fall back to defaults
+        const numRays   = Math.max(3, Math.min(25, (opts.numRays | 0) || 9));
+        const sensorFov = Math.max(30, Math.min(360, opts.sensorFov || 160));
+        const halfFovR  = (sensorFov * Math.PI / 180) / 2;
+        const rayAngles = numRays === 1
+          ? [0]
+          : Array.from({ length: numRays }, (_, i) => -halfFovR + (i / (numRays - 1)) * halfFovR * 2);
+        const rayMax    = Math.max(10, Math.min(200, (opts.maxRayDist | 0) || 40));
+        const inputDim  = numRays + 2;
+
+        s.numRays      = numRays;
+        s.rayAngles    = rayAngles;
+        s.rayMax       = rayMax;
+        s.inputDim     = inputDim;
+        s.debugRaycasts = !!opts.debugRaycasts;
+
         s.arch = {
           ...ARCH,
-          hidden:     Array.isArray(opts.hidden) && opts.hidden.length ? opts.hidden : ARCH.hidden,
-          activation: opts.activation || ARCH.activation,
+          inputDim,
+          hidden:      Array.isArray(opts.hidden) && opts.hidden.length ? opts.hidden : ARCH.hidden,
+          activation:  opts.activation || ARCH.activation,
+          numRays, sensorFov, maxRayDist: rayMax, debugRaycasts: s.debugRaycasts,
         };
 
         s.track = generateTrack(seed || 0xC0FFEE);
 
         // Resume from saved state when available; fall back to fresh population.
         const savedPop = loadPopFromStorage(storage, id);
-        if (savedPop) {
+        const savedArch = savedPop && savedPop.arch;
+        const savedInputDim = savedArch && savedArch.inputDim;
+        const savedHidden   = savedArch ? JSON.stringify(savedArch.hidden || []) : null;
+        const currentHidden = JSON.stringify(Array.isArray(opts.hidden) && opts.hidden.length ? opts.hidden : ARCH.hidden);
+        const archMismatch  = savedPop && savedArch && (
+          (savedInputDim && savedInputDim !== inputDim) ||
+          (savedHidden !== null && savedHidden !== currentHidden)
+        );
+        if (savedPop && !archMismatch) {
           s.pop = savedPop;
           s.pop.mutationStd = mutStd;
           s.generation = s.pop.generation || 0;
@@ -369,6 +413,10 @@ module.exports = function ({ storage } = {}) {
             mean: +(h.stats?.mean ?? 0).toFixed(3),
           }));
         } else {
+          if (savedPop) {
+            console.log(`[self-driving-car] arch changed (inputDim ${savedInputDim}→${inputDim} or hidden changed), resetting population.`);
+            try { storage.saveTrainedState(id, { state: null, architecture: s.arch }); } catch (_) {}
+          }
           s.pop = new Population({
             architecture: s.arch,
             size: s.popSize,
@@ -447,6 +495,12 @@ module.exports = function ({ storage } = {}) {
         return { ok: true };
       },
 
+      'self-driving-car:clearSession': (_, opts = {}) => {
+        const key = ((typeof opts === 'string' ? opts : opts.instanceId) || 'default');
+        _sessions.delete(key);
+        return { ok: true };
+      },
+
       // ── Save / load handlers ────────────────────────────────────────────────
 
       'self-driving-car:saveState': (_, opts = {}) => {
@@ -495,7 +549,36 @@ module.exports = function ({ storage } = {}) {
             s.popSize    = pop.size;
             s.generation = pop.generation || 0;
             s.bestFit    = Math.max(0, isFinite(pop.bestFitness) ? pop.bestFitness : 0);
+            // Restore full sensor config when no live training session has set s.arch
+            if (!s.arch) {
+              try {
+                const net = storage.getNetwork(id);
+                if (net && net.architecture) {
+                  const a       = net.architecture;
+                  const nRays   = Math.max(3, Math.min(25, (a.numRays | 0) || 9));
+                  const fov     = Math.max(30, Math.min(360, a.sensorFov || 160));
+                  const halfR   = (fov * Math.PI / 180) / 2;
+                  s.numRays      = nRays;
+                  s.rayAngles    = nRays === 1 ? [0]
+                    : Array.from({ length: nRays }, (_, i) => -halfR + (i / (nRays - 1)) * halfR * 2);
+                  s.rayMax       = Math.max(10, Math.min(200, (a.maxRayDist | 0) || 40));
+                  s.inputDim     = nRays + 2;
+                }
+              } catch (_e) {}
+            }
+            // Generate a track if needed for infer-only mode
+            if (!s.track) s.track = generateTrack(0xC0FFEE);
           }
+        }
+
+        // Always sync debugRaycasts from the latest saved arch — the user may have
+        // toggled it in the Editor tab after training started, so s.debugRaycasts
+        // (set at init time) can be stale.
+        if (storage) {
+          try {
+            const net = storage.getNetwork(id);
+            if (net && net.architecture) s.debugRaycasts = !!net.architecture.debugRaycasts;
+          } catch (_) {}
         }
 
         if (!s.pop || !s.track) return { error: 'No trained model — run training first.' };
@@ -519,7 +602,7 @@ module.exports = function ({ storage } = {}) {
         const genome = s.pop.bestIndividual || s.pop.individuals[0];
         if (!genome) return null;
 
-        const rawInputs = senseCar(s.inferCar, s.inferTrack);
+        const rawInputs = senseCar(s.inferCar, s.inferTrack, s);
         let inputs = rawInputs;
         if (noiseStd > 0) {
           inputs = new Float32Array(rawInputs.length);
@@ -528,16 +611,29 @@ module.exports = function ({ storage } = {}) {
           }
         }
 
-        const outs     = netForward(genome, inputs);
+        const outs     = netForward(genome, inputs, s.inputDim);
         const steer    = Math.max(-1, Math.min(1, outs[0]));
         const throttle = Math.max(-1, Math.min(1, outs[1]));
         stepCar(s.inferCar, steer, throttle);
         updateCarProgress(s.inferCar, s.inferTrack);
 
         const dead = !isOnTrack(s.inferCar.x, s.inferCar.y, s.inferTrack) || s.inferCar.frames >= MAX_FRAMES;
+
+        // Collect ray endpoints for debug overlay
+        let rays;
+        if (s.debugRaycasts) {
+          const rayAngles = s.rayAngles || RAY_ANGLES;
+          const rayMax    = s.rayMax    || RAY_MAX;
+          const car = dead ? null : s.inferCar;
+          if (car) {
+            rays = rayAngles.map(da =>
+              castRayEndpoint(car.x, car.y, car.angle + da, s.inferTrack, rayMax));
+          }
+        }
+
         if (dead) s.inferCar = spawnCar(s.inferTrack);
 
-        return {
+        const result = {
           track: s.inferTrack,
           car: {
             x: s.inferCar.x, y: s.inferCar.y,
@@ -545,6 +641,8 @@ module.exports = function ({ storage } = {}) {
           },
           justReset: dead,
         };
+        if (rays) result.rays = rays;
+        return result;
       },
     },
   };

@@ -31,6 +31,14 @@ function getChatSession(id) {
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
+// ---------- plugin kind labels ----------
+const PLUGIN_KIND_LABELS = {
+  'self-driving-car': 'Self-Driving Car',
+  'snake-neuro':      'Snake (Neuroevolution)',
+  'warehouse-robot':  'Warehouse Robot',
+};
+function pluginKindLabel(k) { return PLUGIN_KIND_LABELS[k] || k; }
+
 // ---------- plugin registry ----------
 
 const pluginRegistry = {
@@ -39,6 +47,7 @@ const pluginRegistry = {
   trainRenderers:     {}, // pluginKind → { fn(root, net, nb), pluginId }  — takes over the Train tab
   trainEditors:       {}, // pluginKind → { fn(root, net, nb), pluginId }  — Edit tab data section
   trainSettings:      {}, // pluginKind → field-label/visibility overrides for the training defaults section
+  archFields:         {}, // pluginKind → { fields[], computeDims(arch) → {inputDim,outputDim} }
 };
 
 async function initPlugins() {
@@ -54,8 +63,9 @@ async function initPlugins() {
       registerTrainEditor:      (kind, fn)  => { pluginRegistry.trainEditors[kind]       = { fn, pluginId: p.id }; },
       // cfg: { lr, bs, epochs, seed, workers, optimizer } each { label?, hint?, hidden? }
       // plus optional cfg.sectionHint to replace the bottom Workers hint text
-      registerTrainSettings:    (kind, cfg) => { pluginRegistry.trainSettings[kind] = cfg; },
-      invoke:                   (ch, ...a)  => window.nb.plugins.invoke(p.id, ch, ...a)
+      registerTrainSettings:    (kind, cfg)  => { pluginRegistry.trainSettings[kind] = cfg; },
+      registerArchFields:       (kind, spec) => { pluginRegistry.archFields[kind] = spec; },
+      invoke:                   (ch, ...a)   => window.nb.plugins.invoke(p.id, ch, ...a)
     };
     try {
       // eslint-disable-next-line no-new-func
@@ -164,10 +174,11 @@ function renderNetworkList() {
     const active = n.id === state.selectedId ? 'active' : '';
     const encBadge = n.encrypted ? '<span class="badge">encrypted</span>' : '';
     const trainBadge = n.trained ? '<span class="badge">trained</span>' : '<span class="badge">new</span>';
+    const kindLabel = n.pluginKind ? pluginKindLabel(n.pluginKind) : (n.kind || '—');
     return `
       <div class="net-item ${active}" data-id="${n.id}">
         <div class="n-name">${escapeHtml(n.name)} ${encBadge}</div>
-        <div class="n-meta">${n.kind || '—'} ${trainBadge}</div>
+        <div class="n-meta">${kindLabel} ${trainBadge}</div>
       </div>`;
   }).join('');
   root.querySelectorAll('.net-item').forEach(el => {
@@ -262,13 +273,13 @@ function renderNetworksTab(root) {
   root.innerHTML = `
     <div class="panel">
       <h2>Editor — ${escapeHtml(n.name)}</h2>
-      <p class="hint">${n.kind || a.kind} · ${n.encrypted ? 'encrypted at rest' : 'stored as plaintext'} · updated ${new Date(n.updatedAt).toLocaleString()}</p>
+      <p class="hint">${a.pluginKind ? pluginKindLabel(a.pluginKind) : (a.kind || '—')} · ${n.encrypted ? 'encrypted at rest' : 'stored as plaintext'} · updated ${new Date(n.updatedAt).toLocaleString()}</p>
 
       <div class="section">
         <h3>Identity</h3>
         <div class="grid-2">
           <label class="field"><span>Name</span><input id="edit-name" type="text" value="${escapeHtml(n.name)}"></label>
-          <label class="field"><span>Type</span><input readonly value="${a.kind}"></label>
+          <label class="field"><span>Type</span><input readonly value="${a.pluginKind ? pluginKindLabel(a.pluginKind) : a.kind}"></label>
         </div>
         <label class="field"><span>Description</span>
           <textarea id="edit-desc" rows="2">${escapeHtml(n.description || '')}</textarea>
@@ -337,6 +348,7 @@ function renderNetworksTab(root) {
       <div class="row">
         <button class="btn primary" id="btn-save">Save changes</button>
         <button class="btn" id="btn-dup">Duplicate</button>
+        <button class="btn" id="btn-reset-weights">Reset</button>
         <div class="spacer"></div>
         <button class="btn" id="btn-backup" style="background:#3a3a3a;color:#b5b5b5;">Backup</button>
         <button class="btn danger" id="btn-delete">Delete</button>
@@ -390,6 +402,23 @@ function renderNetworksTab(root) {
   $('#btn-dup').addEventListener('click', async () => {
     const dup = await window.nb.networks.duplicate(n.id);
     await refreshNetworks(); selectNetwork(dup.id);
+  });
+  $('#btn-reset-weights').addEventListener('click', () => {
+    confirmModal(
+      'Reset weights?',
+      `This will permanently erase all trained weights, optimizer state, and metrics for "${n.name}". Architecture and settings are kept. The next training run will start from scratch.`,
+      async () => {
+        await window.nb.networks.update(n.id, { state: null, optimizerState: null, tokenizer: null, metrics: [] });
+        // For plugin networks, also wipe the in-memory session so the Train tab
+        // doesn't resume from a stale in-memory population on next mount.
+        const pkind = n.architecture?.pluginKind;
+        const pluginInfo = pkind && pluginRegistry.trainRenderers[pkind];
+        if (pluginInfo) {
+          try { await window.nb.plugins.invoke(pluginInfo.pluginId, `${pkind}:clearSession`, { instanceId: n.id }); } catch (_) {}
+        }
+        await loadCurrent(n.id); renderActiveTab(); toast('Weights reset.');
+      }
+    );
   });
   $('#btn-backup').addEventListener('click', () => openBackupModal(n.id));
 
@@ -754,7 +783,50 @@ function dataFormatHint(arch) {
   return 'See Docs → Training data for the expected format.';
 }
 
+function renderPluginArchEditor(fields, a) {
+  const rows = fields.map(f => {
+    const val  = a[f.id] !== undefined ? a[f.id] : f.default;
+    const hint = f.hint ? ` title="${escapeHtml(f.hint)}"` : '';
+    if (f.type === 'number') {
+      const min  = f.min  != null ? ` min="${f.min}"`   : '';
+      const max  = f.max  != null ? ` max="${f.max}"`   : '';
+      const step = f.step != null ? ` step="${f.step}"` : '';
+      return `<label class="field"><span>${escapeHtml(f.label)}</span><input id="paf-${f.id}" type="number" value="${val}"${min}${max}${step}${hint}></label>`;
+    }
+    if (f.type === 'boolean') {
+      return `<label class="field" style="flex-direction:row;align-items:center;gap:8px;"><input id="paf-${f.id}" type="checkbox"${val ? ' checked' : ''} style="width:16px;height:16px;flex-shrink:0;"${hint}><span>${escapeHtml(f.label)}</span></label>`;
+    }
+    if (f.type === 'activation') {
+      const opts = ['relu', 'leakyRelu', 'tanh', 'sigmoid', 'gelu'].map(k => `<option${val === k ? ' selected' : ''} value="${k}">${k}</option>`).join('');
+      return `<label class="field"><span>${escapeHtml(f.label)}</span><select id="paf-${f.id}"${hint}>${opts}</select></label>`;
+    }
+    if (f.type === 'layers') {
+      return `<label class="field"><span>${escapeHtml(f.label)}</span><input id="paf-${f.id}" type="text" value="${Array.isArray(val) ? val.join(',') : val}"${hint}></label>`;
+    }
+    return '';
+  }).join('');
+  return `<div class="grid-3">${rows}</div>`;
+}
+
 function archEditor(a) {
+  if (a.pluginKind && pluginRegistry.archFields[a.pluginKind]) {
+    return renderPluginArchEditor(pluginRegistry.archFields[a.pluginKind].fields, a);
+  }
+  if (a.pluginKind) {
+    return `
+      <div class="grid-3">
+        <label class="field"><span>Input dim</span><input readonly value="${a.inputDim}" title="Fixed by the plugin simulation"></label>
+        <label class="field"><span>Output dim</span><input readonly value="${a.outputDim}" title="Fixed by the plugin simulation"></label>
+        <label class="field"><span>Activation</span>
+          <select id="a-act">
+            ${['relu', 'leakyRelu', 'tanh', 'sigmoid', 'gelu'].map(k => `<option ${a.activation === k ? 'selected' : ''} value="${k}">${k}</option>`).join('')}
+          </select>
+        </label>
+        <label class="field"><span>Hidden layers (comma-separated)</span><input id="a-hidden" type="text" value="${(a.hidden || []).join(',')}"></label>
+      </div>
+      <p style="font-size:11px;color:#555;margin:6px 0 0;">Input and output dimensions are fixed by the ${pluginKindLabel(a.pluginKind)} simulation and cannot be changed here.</p>
+    `;
+  }
   if (a.kind === 'classifier' || a.kind === 'mlp' || a.kind === 'regressor') {
     return `
       <div class="grid-3">
@@ -814,7 +886,34 @@ async function saveEditor() {
     }
   };
   const a = { ...n.architecture };
-  if (a.kind === 'classifier' || a.kind === 'mlp' || a.kind === 'regressor') {
+  if (a.pluginKind) {
+    const spec = pluginRegistry.archFields[a.pluginKind];
+    if (spec) {
+      for (const f of spec.fields) {
+        const el = document.getElementById(`paf-${f.id}`);
+        if (!el) continue;
+        if (f.type === 'number') {
+          let v = parseFloat(el.value);
+          if (isNaN(v)) v = f.default ?? 0;
+          if (f.min != null) v = Math.max(f.min, v);
+          if (f.max != null) v = Math.min(f.max, v);
+          a[f.id] = v;
+        } else if (f.type === 'boolean') {
+          a[f.id] = el.checked;
+        } else if (f.type === 'activation') {
+          a[f.id] = el.value;
+        } else if (f.type === 'layers') {
+          const parsed = el.value.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0);
+          a[f.id] = parsed.length ? parsed : (Array.isArray(f.default) ? f.default : []);
+        }
+      }
+      if (spec.computeDims) {
+        const { inputDim, outputDim } = spec.computeDims(a);
+        if (inputDim  != null) a.inputDim  = inputDim;
+        if (outputDim != null) a.outputDim = outputDim;
+      }
+    }
+  } else if (a.kind === 'classifier' || a.kind === 'mlp' || a.kind === 'regressor') {
     a.inputDim = parseInt($('#a-in').value);
     a.outputDim = parseInt($('#a-out').value);
     a.activation = $('#a-act').value;

@@ -10,12 +10,12 @@ try {
   console.error('[warehouse-robot] Failed to load DQNAgent:', e.message);
 }
 
-// ── Environment constants ─────────────────────────────────────────────────────
-const GRID       = 8;
-const MAX_STEPS  = 200;
-const N_ACTIONS  = 4;
+// ── Environment constants (defaults) ─────────────────────────────────────────
+const GRID        = 8;
+const MAX_STEPS   = 200;
+const N_ACTIONS   = 4;
 const N_OBSTACLES = 4;
-const DIRS       = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+const DIRS        = [[-1, 0], [1, 0], [0, -1], [0, 1]];
 
 // State: robot(2) + carrying(1) + boxes(nBoxes×2) + targets(nBoxes×2)
 //        + box→target relative offsets(nBoxes×2) + robot→goal relative(2)
@@ -29,7 +29,7 @@ function makeSession() {
     episode: 0, epReward: 0, totalSteps: 0,
     bestReward: -Infinity, rewardHistory: [],
     inferEnv: null, inferEpReward: 0, inferLapsDone: 0,
-    nBoxes: 1,
+    nBoxes: 1, gridSize: GRID, numObstacles: N_OBSTACLES,
   };
 }
 const _sessions = new Map();
@@ -42,31 +42,34 @@ function getSession(id) {
 // ── LCG for seeded obstacle generation ───────────────────────────────────────
 function lcg(s) { return (Math.imul(s | 0, 1664525) + 1013904223) >>> 0; }
 
-function generateObstacles(seed) {
+function generateObstacles(seed, gridSize, numObstacles) {
+  const G = gridSize     || GRID;
+  const N = numObstacles != null ? numObstacles : N_OBSTACLES;
   let rng = (seed || 0xABCD1234) >>> 0;
   const used = new Set();
   function randCell() {
     let r, c, key;
     do {
-      rng = lcg(rng); r = Math.floor((rng / 4294967296) * GRID);
-      rng = lcg(rng); c = Math.floor((rng / 4294967296) * GRID);
-      key = r * GRID + c;
+      rng = lcg(rng); r = Math.floor((rng / 4294967296) * G);
+      rng = lcg(rng); c = Math.floor((rng / 4294967296) * G);
+      key = r * G + c;
     } while (used.has(key));
     used.add(key);
     return [r, c];
   }
-  return Array.from({ length: N_OBSTACLES }, randCell);
+  return Array.from({ length: N }, randCell);
 }
 
 // ── Per-episode reset ─────────────────────────────────────────────────────────
-function resetEpisode(nBoxes, obstacles) {
-  const used = new Set(obstacles.map(([r, c]) => r * GRID + c));
+function resetEpisode(nBoxes, obstacles, gridSize) {
+  const G    = gridSize || GRID;
+  const used = new Set(obstacles.map(([r, c]) => r * G + c));
   function randCell() {
     let r, c, key;
     do {
-      r = Math.floor(Math.random() * GRID);
-      c = Math.floor(Math.random() * GRID);
-      key = r * GRID + c;
+      r = Math.floor(Math.random() * G);
+      c = Math.floor(Math.random() * G);
+      key = r * G + c;
     } while (used.has(key));
     used.add(key);
     return [r, c];
@@ -84,8 +87,8 @@ function resetEpisode(nBoxes, obstacles) {
 }
 
 // ── State encoding ────────────────────────────────────────────────────────────
-function encodeState(env, nBoxes) {
-  const G = GRID - 1;
+function encodeState(env, nBoxes, gridSize) {
+  const G = (gridSize || GRID) - 1;
   const v = new Float32Array(computeStateDim(nBoxes));
   let idx = 0;
 
@@ -161,13 +164,14 @@ function shapingPotential(env, nBoxes) {
 }
 
 // ── Environment step ──────────────────────────────────────────────────────────
-function stepEnv(env, action, nBoxes) {
+function stepEnv(env, action, nBoxes, gridSize) {
+  const G        = gridSize || GRID;
   const [dr, dc] = DIRS[action];
   const [r, c]   = env.robot;
   const nr = r + dr, nc = c + dc;
   const nextStep = env.step + 1;
 
-  if (nr < 0 || nr >= GRID || nc < 0 || nc >= GRID) {
+  if (nr < 0 || nr >= G || nc < 0 || nc >= G) {
     return { env: { ...env, step: nextStep }, reward: -0.5, done: nextStep >= MAX_STEPS };
   }
 
@@ -215,7 +219,7 @@ function buildVisualState(s) {
   if (!s.env) return null;
   const env = s.env;
   return {
-    grid: GRID, nBoxes: s.nBoxes,
+    grid: s.gridSize || GRID, nBoxes: s.nBoxes,
     robot:         env.robot,
     carrying:      env.carrying,
     boxes:         env.boxes,
@@ -245,8 +249,13 @@ function saveAgentToStorage(storage, id, s) {
   if (!storage || !s.agent) return;
   try {
     const agentJson = s.agent.toJSON();
-    // Preserve pluginKind when updating the stored architecture.
-    const architecture = { ...agentJson.arch, pluginKind: 'warehouse-robot' };
+    const architecture = {
+      ...agentJson.arch,
+      pluginKind: 'warehouse-robot',
+      numBoxes:     s.nBoxes,
+      gridSize:     s.gridSize     || GRID,
+      numObstacles: s.numObstacles != null ? s.numObstacles : N_OBSTACLES,
+    };
     storage.saveTrainedState(id, { state: agentJson, architecture });
   } catch (e) {
     console.warn('[warehouse-robot] Could not save state:', e.message);
@@ -275,16 +284,21 @@ module.exports = function ({ storage } = {}) {
       const id = opts.instanceId || 'default';
       const s  = getSession(id);
 
-      s.nBoxes = Math.max(1, Math.min(5, (opts.nBoxes | 0) || 1));
-      const obstacles = generateObstacles(opts.seed || 42);
+      s.nBoxes       = Math.max(1, Math.min(5,  (opts.nBoxes       | 0) || 1));
+      s.gridSize     = Math.max(4, Math.min(16, (opts.gridSize     | 0) || GRID));
+      s.numObstacles = Math.max(0, Math.min(
+        Math.floor(s.gridSize * s.gridSize * 0.25),
+        opts.numObstacles != null ? (opts.numObstacles | 0) : N_OBSTACLES
+      ));
+      const obstacles = generateObstacles(opts.seed || 42, s.gridSize, s.numObstacles);
 
-      // Resume from saved state when available (nBoxes must match).
+      // Resume from saved state when available (stateDim = f(nBoxes) only).
       const savedAgent = loadAgentFromStorage(storage, id);
       if (savedAgent && savedAgent.arch && savedAgent.arch.inputDim === computeStateDim(s.nBoxes)) {
-        s.agent       = savedAgent;
-        s.agent.epsilon = Math.min(savedAgent.epsilon, 0.15); // cap epsilon for resumed training
+        s.agent         = savedAgent;
+        s.agent.epsilon = Math.min(savedAgent.epsilon, 0.15);
       } else {
-        const hidden = Array.isArray(opts.hidden) && opts.hidden.length ? opts.hidden : [128, 64];
+        const hidden     = Array.isArray(opts.hidden) && opts.hidden.length ? opts.hidden : [128, 64];
         const activation = opts.activation || 'relu';
         s.agent = new _DQNAgent({
           architecture: {
@@ -303,14 +317,14 @@ module.exports = function ({ storage } = {}) {
         });
       }
 
-      s.env          = resetEpisode(s.nBoxes, obstacles);
-      s.running      = true;
-      s.episode      = 0;
-      s.epReward     = 0;
-      s.totalSteps   = 0;
-      s.bestReward   = -Infinity;
+      s.env           = resetEpisode(s.nBoxes, obstacles, s.gridSize);
+      s.running       = true;
+      s.episode       = 0;
+      s.epReward      = 0;
+      s.totalSteps    = 0;
+      s.bestReward    = -Infinity;
       s.rewardHistory = [];
-      return { ok: true, grid: GRID, nBoxes: s.nBoxes, resumed: !!(savedAgent) };
+      return { ok: true, grid: s.gridSize, nBoxes: s.nBoxes, resumed: !!(savedAgent) };
     },
 
     'warehouse-robot:getState': (_, opts = {}) => {
@@ -325,10 +339,10 @@ module.exports = function ({ storage } = {}) {
       const n = Math.max(1, Math.min((opts.n || (typeof opts === 'number' ? opts : 4)) | 0, 20));
 
       for (let i = 0; i < n; i++) {
-        const state  = encodeState(s.env, s.nBoxes);
+        const state  = encodeState(s.env, s.nBoxes, s.gridSize);
         const a      = s.agent.selectAction(state);
-        const { env: next, reward, done } = stepEnv(s.env, a, s.nBoxes);
-        const ns     = encodeState(next, s.nBoxes);
+        const { env: next, reward, done } = stepEnv(s.env, a, s.nBoxes, s.gridSize);
+        const ns     = encodeState(next, s.nBoxes, s.gridSize);
         s.agent.observe(state, a, reward, ns, done);
         s.epReward   += reward;
         s.totalSteps += 1;
@@ -340,7 +354,7 @@ module.exports = function ({ storage } = {}) {
           if (s.epReward > s.bestReward) s.bestReward = s.epReward;
           s.episode++;
           s.epReward = 0;
-          s.env = resetEpisode(s.nBoxes, s.env.obstacles);
+          s.env = resetEpisode(s.nBoxes, s.env.obstacles, s.gridSize);
         }
       }
 
@@ -366,7 +380,7 @@ module.exports = function ({ storage } = {}) {
       const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
       const s  = getSession(id);
       if (!s.agent) return { error: 'Not initialized — call init first.' };
-      s.env           = resetEpisode(s.nBoxes, s.env.obstacles);
+      s.env           = resetEpisode(s.nBoxes, s.env.obstacles, s.gridSize);
       s.episode       = 0;
       s.epReward      = 0;
       s.totalSteps    = 0;
@@ -374,6 +388,12 @@ module.exports = function ({ storage } = {}) {
       s.rewardHistory = [];
       s.agent.epsilon = s.agent.epsilonStart;
       s.running       = true;
+      return { ok: true };
+    },
+
+    'warehouse-robot:clearSession': (_, opts = {}) => {
+      const key = ((typeof opts === 'string' ? opts : opts.instanceId) || 'default');
+      _sessions.delete(key);
       return { ok: true };
     },
 
@@ -397,7 +417,7 @@ module.exports = function ({ storage } = {}) {
         ? Math.round((agent.arch.inputDim - 5) / 6)
         : s.nBoxes) || 1;
       if (s.env) {
-        s.env = resetEpisode(s.nBoxes, s.env.obstacles || generateObstacles(42));
+        s.env = resetEpisode(s.nBoxes, s.env.obstacles || generateObstacles(42, s.gridSize, s.numObstacles), s.gridSize);
       }
       return { ok: true, nBoxes: s.nBoxes, epsilon: +agent.epsilon.toFixed(4) };
     },
@@ -416,17 +436,26 @@ module.exports = function ({ storage } = {}) {
           s.nBoxes = (agent.arch && agent.arch.inputDim
             ? Math.round((agent.arch.inputDim - 5) / 6)
             : 1) || 1;
-          const obstacles = generateObstacles(42);
-          s.env = resetEpisode(s.nBoxes, obstacles);
+          // Restore grid config from saved arch
+          try {
+            const net = storage.getNetwork(id);
+            if (net && net.architecture) {
+              const a = net.architecture;
+              s.gridSize     = Math.max(4, Math.min(16, (a.gridSize     | 0) || GRID));
+              s.numObstacles = Math.max(0, (a.numObstacles | 0) != null ? (a.numObstacles | 0) : N_OBSTACLES);
+            }
+          } catch (_e) {}
+          const obstacles = generateObstacles(42, s.gridSize, s.numObstacles);
+          s.env = resetEpisode(s.nBoxes, obstacles, s.gridSize);
         }
       }
 
       if (!s.agent) return { error: 'No trained agent — run training first.' };
-      s.inferEnv      = resetEpisode(s.nBoxes, s.env.obstacles);
+      s.inferEnv      = resetEpisode(s.nBoxes, s.env.obstacles, s.gridSize);
       s.inferEpReward = 0;
       s.inferLapsDone = 0;
       return {
-        ok: true, grid: GRID, nBoxes: s.nBoxes,
+        ok: true, grid: s.gridSize || GRID, nBoxes: s.nBoxes,
         epsilon:    +s.agent.epsilon.toFixed(4),
         totalSteps: s.totalSteps,
         episode:    s.episode,
@@ -440,7 +469,7 @@ module.exports = function ({ storage } = {}) {
       const s        = getSession(id);
       if (!s.agent || !s.inferEnv) return null;
 
-      const rawState = encodeState(s.inferEnv, s.nBoxes);
+      const rawState = encodeState(s.inferEnv, s.nBoxes, s.gridSize);
       let state = rawState;
       if (noiseStd > 0) {
         state = new Float32Array(rawState.length);
@@ -452,7 +481,7 @@ module.exports = function ({ storage } = {}) {
       const action = s.agent.selectAction(state);
       s.agent.epsilon = savedEps;
 
-      const { env: next, reward, done } = stepEnv(s.inferEnv, action, s.nBoxes);
+      const { env: next, reward, done } = stepEnv(s.inferEnv, action, s.nBoxes, s.gridSize);
       s.inferEpReward += reward;
       s.inferEnv       = next;
 
@@ -460,12 +489,12 @@ module.exports = function ({ storage } = {}) {
       if (done) {
         s.inferLapsDone++;
         s.inferEpReward = 0;
-        s.inferEnv      = resetEpisode(s.nBoxes, s.env.obstacles);
+        s.inferEnv      = resetEpisode(s.nBoxes, s.env.obstacles, s.gridSize);
         justReset       = true;
       }
 
       return {
-        grid: GRID, nBoxes: s.nBoxes,
+        grid: s.gridSize || GRID, nBoxes: s.nBoxes,
         robot:         s.inferEnv.robot,
         carrying:      s.inferEnv.carrying,
         boxes:         s.inferEnv.boxes,

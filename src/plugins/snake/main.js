@@ -13,14 +13,14 @@ try {
   console.error('[snake-neuro] Failed to load engines:', e.message);
 }
 
-// ── Simulation constants ───────────────────────────────────────────────────────
+// ── Simulation constants (defaults) ───────────────────────────────────────────
 const GRID_W          = 15;
 const GRID_H          = 17;
-const INPUT_DIM       = GRID_W * GRID_H;   // 255 — full grid occupancy map
+const INPUT_DIM       = GRID_W * GRID_H;   // 255
 const OUTPUT_DIM      = 4;                  // up, right, down, left
-const POP_SIZE        = 50;                 // Optimized: Increased population for better exploration
-const GEN_DURATION_MS = 8000;               // Optimized: Slightly longer generation for better evaluation
-const STALE_LIMIT     = 150;                // Optimized: Tighter limit to force efficient pathfinding
+const POP_SIZE        = 50;
+const GEN_DURATION_MS = 8000;
+const STALE_LIMIT     = 150;
 
 // Direction vectors: 0=up, 1=right, 2=down, 3=left
 const DIRS = [[0, -1], [1, 0], [0, 1], [-1, 0]];
@@ -38,6 +38,7 @@ const ARCH = {
 function makeSession() {
   return {
     pop:          null,
+    popSize:      POP_SIZE,
     snakes:       [],
     snakeFit:     [],
     generation:   0,
@@ -48,6 +49,10 @@ function makeSession() {
     genStartTime: 0,
     inferSnake:   null,
     arch:         null,
+    gridW:        GRID_W,
+    gridH:        GRID_H,
+    inputDim:     INPUT_DIM,
+    staleLimit:   STALE_LIMIT,
   };
 }
 
@@ -60,65 +65,59 @@ function getSession(id) {
 
 // ── Snake helpers ──────────────────────────────────────────────────────────────
 
-function randomPos(body) {
-  const total      = GRID_W * GRID_H;
-  const occupiedSet = new Set(body.map(p => p.y * GRID_W + p.x));
+function randomPos(body, gridW, gridH) {
+  const gW = gridW || GRID_W, gH = gridH || GRID_H;
+  const total       = gW * gH;
+  const occupiedSet = new Set(body.map(p => p.y * gW + p.x));
   if (occupiedSet.size >= total) return { x: 0, y: 0 };
   let idx;
   do { idx = Math.floor(Math.random() * total); } while (occupiedSet.has(idx));
-  return { x: idx % GRID_W, y: Math.floor(idx / GRID_W) };
+  return { x: idx % gW, y: Math.floor(idx / gW) };
 }
 
-function spawnSnake() {
-  const cx = Math.floor(GRID_W / 2);
-  const cy = Math.floor(GRID_H / 2);
+function spawnSnake(gridW, gridH) {
+  const gW = gridW || GRID_W, gH = gridH || GRID_H;
+  const cx = Math.floor(gW / 2);
+  const cy = Math.floor(gH / 2);
   const body = [
     { x: cx, y: cy },
     { x: cx, y: cy + 1 },
     { x: cx, y: cy + 2 },
   ];
   return {
-    body,               // body[0] = head, body[last] = tail
-    dir:              0, // 0=up initially
-    apple:            randomPos(body),
-    alive:            true,
-    applesEaten:      0,
-    steps:            0,
-    stepsSinceApple:  0,
+    body,
+    dir:             0,
+    apple:           randomPos(body, gW, gH),
+    alive:           true,
+    applesEaten:     0,
+    steps:           0,
+    stepsSinceApple: 0,
   };
 }
 
 /**
- * Optimized Grid Encoding with 5-class labels:
- * 0.0  = Blank
- * 1.0  = Apple
- * 0.5  = Snake Head
- * 0.25 = Snake Body
- * -0.5 = Snake End (Tail)
- *
- * Using distinct values helps the neural network distinguish between functional parts.
+ * 5-class grid encoding:
+ *  0.0  = Blank   1.0 = Apple   0.5 = Head   0.25 = Body   -0.5 = Tail
  */
-function buildGrid(snake) {
-  const grid = new Float32Array(INPUT_DIM);
-  // Fill snake parts
+function buildGrid(snake, gridW, gridH) {
+  const gW  = gridW  || GRID_W;
+  const gH  = gridH  || GRID_H;
+  const dim = gW * gH;
+  const grid = new Float32Array(dim);
   for (let i = 0; i < snake.body.length; i++) {
     const { x, y } = snake.body[i];
-    const idx = y * GRID_W + x;
-    if (i === 0) {
-      grid[idx] = 0.5; // Snake Head
-    } else if (i === snake.body.length - 1) {
-      grid[idx] = -0.5; // Snake End (Tail)
-    } else {
-      grid[idx] = 0.25; // Snake Body
-    }
+    const idx = y * gW + x;
+    if      (i === 0)                       grid[idx] = 0.5;
+    else if (i === snake.body.length - 1)   grid[idx] = -0.5;
+    else                                    grid[idx] = 0.25;
   }
-  // Fill apple
-  grid[snake.apple.y * GRID_W + snake.apple.x] = 1.0; // Apple
+  grid[snake.apple.y * gW + snake.apple.x] = 1.0;
   return grid;
 }
 
-function netForward(model, inputArr) {
-  const x   = new T.Tensor([1, INPUT_DIM], inputArr, false);
+function netForward(model, inputArr, inputDim) {
+  const dim = inputDim || INPUT_DIM;
+  const x   = new T.Tensor([1, dim], inputArr, false);
   const out = model.forward(x, { training: false });
   return out.data;
 }
@@ -129,11 +128,15 @@ function argmax(arr) {
   return best;
 }
 
-function stepSnake(snake, model) {
+function stepSnake(snake, model, s) {
   if (!snake.alive) return;
+  const gridW      = (s && s.gridW)      || GRID_W;
+  const gridH      = (s && s.gridH)      || GRID_H;
+  const inputDim   = (s && s.inputDim)   || INPUT_DIM;
+  const staleLimit = (s && s.staleLimit) || STALE_LIMIT;
 
-  const grid   = buildGrid(snake);
-  const outs   = netForward(model, grid);
+  const grid   = buildGrid(snake, gridW, gridH);
+  const outs   = netForward(model, grid, inputDim);
   const rawDir = argmax(outs);
 
   const opposite = (snake.dir + 2) % 4;
@@ -143,12 +146,11 @@ function stepSnake(snake, model) {
   const nx = snake.body[0].x + dx;
   const ny = snake.body[0].y + dy;
 
-  if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) {
+  if (nx < 0 || nx >= gridW || ny < 0 || ny >= gridH) {
     snake.alive = false;
     return;
   }
 
-  // Optimized self-collision: check all segments
   for (let i = 0; i < snake.body.length; i++) {
     if (snake.body[i].x === nx && snake.body[i].y === ny) {
       snake.alive = false;
@@ -161,7 +163,7 @@ function stepSnake(snake, model) {
   if (nx === snake.apple.x && ny === snake.apple.y) {
     snake.applesEaten++;
     snake.stepsSinceApple = 0;
-    snake.apple = randomPos(snake.body);
+    snake.apple = randomPos(snake.body, gridW, gridH);
   } else {
     snake.body.pop();
   }
@@ -169,51 +171,38 @@ function stepSnake(snake, model) {
   snake.steps++;
   snake.stepsSinceApple++;
 
-  if (snake.stepsSinceApple > STALE_LIMIT) {
+  if (snake.stepsSinceApple > staleLimit) {
     snake.alive = false;
   }
 }
 
-/**
- * Optimized Fitness Function:
- * Encourages eating apples while providing small rewards for surviving and
- * moving towards apples to avoid random wandering.
- */
 function manhattanDistance(p1, p2) {
   return Math.abs(p1.x - p2.x) + Math.abs(p1.y - p2.y);
 }
 
-const MAX_DISTANCE = GRID_W + GRID_H - 2; // Max Manhattan distance on the grid
-
-function snakeFitness(snake) {
+function snakeFitness(snake, gridW, gridH) {
+  const gW = gridW || GRID_W, gH = gridH || GRID_H;
+  const maxDist = gW + gH - 2;
   let fitness = snake.applesEaten;
-
-  // Incorporate distance to apple
   if (snake.alive) {
-    const head = snake.body[0];
-    const distToApple = manhattanDistance(head, snake.apple);
-    fitness -= (distToApple / MAX_DISTANCE);
+    const distToApple = manhattanDistance(snake.body[0], snake.apple);
+    fitness -= (distToApple / maxDist);
   }
-
-  // Apply death penalty
-  if (!snake.alive) {
-    fitness *= 0.9;
-  }
-
-  // Ensure fitness is not negative
+  if (!snake.alive) fitness *= 0.9;
   return Math.max(0, fitness);
 }
 
 function stepGeneration(s, opts) {
   if (!s.pop || !s.running) return null;
 
-  const ticks   = Math.max(1, Math.min((opts.ticks || 10), 50)); // Optimized: Higher tick cap for faster simulation
+  const ticks   = Math.max(1, Math.min((opts.ticks || 10), 50));
   const now     = Date.now();
   const elapsed = now - s.genStartTime;
   const allDead = s.snakes.every(sn => !sn.alive);
+  const popSize = s.popSize || POP_SIZE;
 
   if (elapsed >= GEN_DURATION_MS || allDead) {
-    s.snakes.forEach((sn, i) => { s.snakeFit[i] = snakeFitness(sn); });
+    s.snakes.forEach((sn, i) => { s.snakeFit[i] = snakeFitness(sn, s.gridW, s.gridH); });
     s.pop.evaluate((_, idx) => s.snakeFit[idx]);
 
     const stats = s.pop.evolve();
@@ -229,14 +218,14 @@ function stepGeneration(s, opts) {
     if (best > s.bestFit) s.bestFit = best;
     s.genBestFit = best;
 
-    s.snakes       = Array.from({ length: POP_SIZE }, () => spawnSnake());
-    s.snakeFit     = new Array(POP_SIZE).fill(0);
+    s.snakes       = Array.from({ length: popSize }, () => spawnSnake(s.gridW, s.gridH));
+    s.snakeFit     = new Array(popSize).fill(0);
     s.genStartTime = Date.now();
 
   } else {
     for (let t = 0; t < ticks; t++) {
-      for (let i = 0; i < POP_SIZE; i++) {
-        if (s.snakes[i].alive) stepSnake(s.snakes[i], s.pop.individuals[i]);
+      for (let i = 0; i < popSize; i++) {
+        if (s.snakes[i].alive) stepSnake(s.snakes[i], s.pop.individuals[i], s);
       }
     }
   }
@@ -254,13 +243,15 @@ function buildVisualState(s) {
       applesEaten:  sn.applesEaten,
       dir:          sn.dir,
     })),
-    generation:   s.generation,
-    aliveCnt:     s.snakes.filter(sn => sn.alive).length,
-    bestFit:      +s.bestFit.toFixed(3),
-    genBestFit:   +s.genBestFit.toFixed(3),
-    genHistory:   s.genHistory.slice(-60),
+    generation:    s.generation,
+    aliveCnt:      s.snakes.filter(sn => sn.alive).length,
+    bestFit:       +s.bestFit.toFixed(3),
+    genBestFit:    +s.genBestFit.toFixed(3),
+    genHistory:    s.genHistory.slice(-60),
     timeLeft,
     hasBestGenome: s.pop !== null && s.pop.bestIndividual !== null,
+    gridW:         s.gridW || GRID_W,
+    gridH:         s.gridH || GRID_H,
   };
 }
 
@@ -269,7 +260,8 @@ function buildVisualState(s) {
 function savePopToStorage(storage, id, s) {
   if (!storage || !s.pop) return;
   try {
-    storage.saveTrainedState(id, { state: s.pop.toJSON(), architecture: ARCH });
+    const arch = { ...(s.arch || ARCH), pluginKind: 'snake-neuro' };
+    storage.saveTrainedState(id, { state: s.pop.toJSON(), architecture: arch });
   } catch (e) {
     console.warn('[snake-neuro] Could not save state:', e.message);
   }
@@ -298,19 +290,35 @@ module.exports = function ({ storage } = {}) {
 
       'snake-neuro:init': (_, opts = {}) => {
         if (!Population || !T) return { error: 'Neuroevolution engine unavailable.' };
-        const id = opts.instanceId || 'default';
-        const s  = getSession(id);
+        const id     = opts.instanceId || 'default';
+        const s      = getSession(id);
         const mutStd = opts.mutStd || 0.05;
+
+        // Grid / population config from opts
+        const gridW      = Math.max(4,  Math.min(30,  (opts.gridW      | 0) || GRID_W));
+        const gridH      = Math.max(4,  Math.min(30,  (opts.gridH      | 0) || GRID_H));
+        const popSize    = Math.max(5,  Math.min(200, (opts.popSize    | 0) || POP_SIZE));
+        const staleLimit = Math.max(20, Math.min(400, (opts.staleLimit | 0) || STALE_LIMIT));
+        const inputDim   = gridW * gridH;
+
+        s.gridW      = gridW;
+        s.gridH      = gridH;
+        s.popSize    = popSize;
+        s.staleLimit = staleLimit;
+        s.inputDim   = inputDim;
 
         s.arch = {
           ...ARCH,
+          inputDim,
           hidden:     Array.isArray(opts.hidden) && opts.hidden.length ? opts.hidden : ARCH.hidden,
           activation: opts.activation || ARCH.activation,
+          gridW, gridH, popSize, staleLimit,
         };
 
         // Resume from saved state when available; fall back to fresh population.
-        const savedPop = loadPopFromStorage(storage, id);
-        if (savedPop) {
+        const savedPop      = loadPopFromStorage(storage, id);
+        const savedInputDim = savedPop && savedPop.arch && savedPop.arch.inputDim;
+        if (savedPop && (!savedInputDim || savedInputDim === inputDim)) {
           s.pop = savedPop;
           s.pop.mutationStd = mutStd;
           s.generation = s.pop.generation || 0;
@@ -321,22 +329,23 @@ module.exports = function ({ storage } = {}) {
             mean: +(h.stats?.mean ?? 0).toFixed(3),
           }));
         } else {
+          if (savedPop) console.log(`[snake-neuro] inputDim changed (${savedInputDim}→${inputDim}), resetting population.`);
           s.pop = new Population({
             architecture: s.arch,
-            size:         POP_SIZE,
+            size:         popSize,
             eliteCount:   2,
             pMutate:      0.15,
             mutationStd:  mutStd,
             tournamentK:  3,
             seed:         opts.seed || 42,
           });
-          s.generation   = 0;
-          s.bestFit      = 0;
-          s.genHistory   = [];
+          s.generation = 0;
+          s.bestFit    = 0;
+          s.genHistory = [];
         }
 
-        s.snakes       = Array.from({ length: POP_SIZE }, () => spawnSnake());
-        s.snakeFit     = new Array(POP_SIZE).fill(0);
+        s.snakes       = Array.from({ length: popSize }, () => spawnSnake(gridW, gridH));
+        s.snakeFit     = new Array(popSize).fill(0);
         s.genBestFit   = 0;
         s.running      = true;
         s.genStartTime = Date.now();
@@ -369,19 +378,20 @@ module.exports = function ({ storage } = {}) {
         const id = (typeof opts === 'string' ? opts : opts.instanceId) || 'default';
         const s  = getSession(id);
         if (!Population || !T) return { error: 'Engine unavailable.' };
+        const popSize = s.popSize || POP_SIZE;
 
         s.pop = new Population({
           architecture: s.arch || ARCH,
-          size:        POP_SIZE,
-          eliteCount:  2,
-          pMutate:     0.15,
-          mutationStd: 0.05,
-          tournamentK: 3,
-          seed:        Math.floor(Math.random() * 0xFFFFFF),
+          size:         popSize,
+          eliteCount:   2,
+          pMutate:      0.15,
+          mutationStd:  0.05,
+          tournamentK:  3,
+          seed:         Math.floor(Math.random() * 0xFFFFFF),
         });
 
-        s.snakes       = Array.from({ length: POP_SIZE }, () => spawnSnake());
-        s.snakeFit     = new Array(POP_SIZE).fill(0);
+        s.snakes       = Array.from({ length: popSize }, () => spawnSnake(s.gridW, s.gridH));
+        s.snakeFit     = new Array(popSize).fill(0);
         s.generation   = 0;
         s.bestFit      = 0;
         s.genBestFit   = 0;
@@ -389,6 +399,12 @@ module.exports = function ({ storage } = {}) {
         s.genHistory   = [];
         s.genStartTime = Date.now();
 
+        return { ok: true };
+      },
+
+      'snake-neuro:clearSession': (_, opts = {}) => {
+        const key = ((typeof opts === 'string' ? opts : opts.instanceId) || 'default');
+        _sessions.delete(key);
         return { ok: true };
       },
 
@@ -422,8 +438,9 @@ module.exports = function ({ storage } = {}) {
           best: +(h.stats?.max ?? 0).toFixed(3),
           mean: +(h.stats?.mean ?? 0).toFixed(3),
         }));
-        s.snakes       = Array.from({ length: POP_SIZE }, () => spawnSnake());
-        s.snakeFit     = new Array(POP_SIZE).fill(0);
+        const popSize = s.popSize || POP_SIZE;
+        s.snakes       = Array.from({ length: popSize }, () => spawnSnake(s.gridW, s.gridH));
+        s.snakeFit     = new Array(popSize).fill(0);
         s.genStartTime = Date.now();
         if (wasRunning) s.running = true;
         return { ok: true, generation: s.generation, bestFit: +s.bestFit.toFixed(3) };
@@ -442,14 +459,34 @@ module.exports = function ({ storage } = {}) {
             s.pop        = pop;
             s.generation = pop.generation || 0;
             s.bestFit    = Math.max(0, isFinite(pop.bestFitness) ? pop.bestFitness : 0);
+            // Restore grid config from saved arch
+            if (!s.arch) {
+              try {
+                const net = storage.getNetwork(id);
+                if (net && net.architecture) {
+                  const a = net.architecture;
+                  s.gridW      = Math.max(4,  Math.min(30,  (a.gridW      | 0) || GRID_W));
+                  s.gridH      = Math.max(4,  Math.min(30,  (a.gridH      | 0) || GRID_H));
+                  s.staleLimit = Math.max(20, Math.min(400, (a.staleLimit | 0) || STALE_LIMIT));
+                  s.popSize    = Math.max(5,  Math.min(200, (a.popSize    | 0) || POP_SIZE));
+                  s.inputDim   = s.gridW * s.gridH;
+                }
+              } catch (_e) {}
+            }
           }
         }
 
         if (!s.pop) return { error: 'No trained model — run training first.' };
         const genome = s.pop.bestIndividual || s.pop.individuals[0];
         if (!genome) return { error: 'Population not ready.' };
-        s.inferSnake = spawnSnake();
-        return { ok: true, generation: s.generation, bestFit: +s.bestFit.toFixed(3) };
+        s.inferSnake = spawnSnake(s.gridW, s.gridH);
+        return {
+          ok: true,
+          generation: s.generation,
+          bestFit: +s.bestFit.toFixed(3),
+          gridW: s.gridW || GRID_W,
+          gridH: s.gridH || GRID_H,
+        };
       },
 
       'snake-neuro:inferStep': (_, opts = {}) => {
@@ -459,10 +496,10 @@ module.exports = function ({ storage } = {}) {
         const genome = s.pop.bestIndividual || s.pop.individuals[0];
         if (!genome) return null;
 
-        stepSnake(s.inferSnake, genome);
+        stepSnake(s.inferSnake, genome, s);
         let justReset = false;
         if (!s.inferSnake.alive) {
-          s.inferSnake = spawnSnake();
+          s.inferSnake = spawnSnake(s.gridW, s.gridH);
           justReset = true;
         }
 
@@ -477,6 +514,8 @@ module.exports = function ({ storage } = {}) {
           justReset,
           generation: s.generation,
           bestFit:    +s.bestFit.toFixed(3),
+          gridW:      s.gridW || GRID_W,
+          gridH:      s.gridH || GRID_H,
         };
       },
     },

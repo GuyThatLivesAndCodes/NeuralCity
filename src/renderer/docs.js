@@ -1236,6 +1236,7 @@ dropout:    0.1</code></pre>
         ├── main.js          ← extracted mainCode
         └── renderer.js      ← extracted rendererCode</code></pre>
 <p>The plugin directory layout mirrors the built-in <code>src/plugins/</code> directory in the NeuralCabin source tree. Bundled example plugins (such as the Chess plugin) are seeded into this directory on every app launch, ensuring the latest version is always present.</p>
+<p>Networks created from a plugin template carry <code>arch.pluginKind</code> in their saved JSON. The Networks sidebar uses this to show a readable type label (e.g. "Self-Driving Car") instead of the generic "classifier" kind. Opening the Editor → Architecture tab for a plugin model shows the plugin's custom fields (registered via <code>api.registerArchFields()</code>) rather than the default inputDim / hidden-layers form.</p>
 
 <h2>Plugin loading lifecycle</h2>
 <ol>
@@ -1262,13 +1263,15 @@ dropout:    0.1</code></pre>
 <p>This guide walks through creating a complete plugin from scratch — defining main-process logic, writing a renderer UI, packaging it as a <code>.nbpl</code> file, and testing it in the app.</p>
 
 <h2>1. Plan your plugin</h2>
-<p>Every plugin can contribute up to three things:</p>
+<p>Every plugin can contribute up to five things:</p>
 <ul>
   <li><strong>A model template</strong> — appears in the "New Network" modal under "Plugin Models". Defines the network architecture, training defaults, and initial training data.</li>
-  <li><strong>A training editor</strong> — replaces the default JSON textarea on the Train tab for networks created from your template. Lets you build custom data-import UI (file upload, text parsing, etc.).</li>
-  <li><strong>An inference renderer</strong> — replaces the default inference UI for your network type. Use it to build a custom interactive interface for predictions.</li>
+  <li><strong>Architecture fields</strong> — replaces the generic inputDim / hidden-layers form in the Editor tab with domain-specific settings (sensor count, grid size, debug flags, etc.). Use <code>api.registerArchFields()</code>.</li>
+  <li><strong>Train settings overrides</strong> — relabels the standard learning-rate / batch-size / epochs panel with plugin-appropriate names (e.g. "Mutation std" instead of "Learning rate"). Use <code>api.registerTrainSettings()</code>.</li>
+  <li><strong>A training editor</strong> — replaces the default JSON textarea on the Train tab for networks created from your template. Lets you build a live simulation UI, custom data-import widgets, etc.</li>
+  <li><strong>An inference renderer</strong> — replaces the default inference UI for your network type. Use it to build a custom interactive interface for predictions or to visualise a live agent.</li>
 </ul>
-<p>You don't need all three. A plugin can register only a template, or only a training editor + inference renderer with no template.</p>
+<p>You don't need all five. A plugin can register only a template, or any subset of the hooks.</p>
 
 <h2>2. Write the main-process code</h2>
 <p>Create <code>main.js</code>. This file is <code>require()</code>d in Node.js, so you have access to the full Node.js standard library.</p>
@@ -1324,7 +1327,19 @@ module.exports = {
     trainingData: { samples: [] }
   });
 
-  // ── 2. Register a custom training editor ───────────────────────────────
+  // ── 2. Register architecture fields (optional) ────────────────────────
+  api.registerArchFields('my-plugin', {
+    fields: [
+      { id: 'numInputs',  label: 'Input count', type: 'number',
+        default: 16, min: 1, max: 256, step: 1,
+        hint: 'Changing this resets saved weights.' },
+      { id: 'hidden',     label: 'Hidden layers', type: 'layers',     default: [64, 32] },
+      { id: 'activation', label: 'Activation',    type: 'activation', default: 'relu' },
+    ],
+    computeDims: (arch) => ({ inputDim: arch.numInputs || 16, outputDim: 8 }),
+  });
+
+  // ── 3. Register a custom training editor ───────────────────────────────
   // 'my-plugin' matches arch.pluginKind above
   api.registerTrainEditor('my-plugin', function (root, network, nb) {
     root.innerHTML = '&lt;button id="my-upload-btn"&gt;Upload data&lt;/button&gt;';
@@ -1345,7 +1360,7 @@ module.exports = {
     });
   });
 
-  // ── 3. Register a custom inference renderer ────────────────────────────
+  // ── 4. Register a custom inference renderer ────────────────────────────
   api.registerInferenceRenderer('my-plugin', function (root, network, nb) {
     const isTrained = !!(network.state || network.stateLocked);
 
@@ -1370,7 +1385,7 @@ module.exports = {
 
 })(api); // api is injected by the plugin registry</code></pre>
 
-<h2>4. Package as a .nbpl file</h2>
+<h2>5. Package as a .nbpl file</h2>
 <p>Read <code>main.js</code> and <code>renderer.js</code>, embed them as JSON strings, and write the combined manifest:</p>
 <pre><code>// build-nbpl.js — run with: node build-nbpl.js
 const fs = require('fs');
@@ -1392,7 +1407,7 @@ fs.writeFileSync('my-plugin.nbpl', JSON.stringify(nbpl, null, 2));
 console.log('Wrote my-plugin.nbpl');</code></pre>
 <p>Alternatively, build the JSON manually in any text editor — it is just a JSON object with two large string fields.</p>
 
-<h2>5. Testing during development</h2>
+<h2>6. Testing during development</h2>
 <p>The fastest workflow avoids packaging entirely:</p>
 <ol>
   <li>Create a directory <code>src/plugins/my-plugin/</code> in the NeuralCabin source tree.</li>
@@ -1454,6 +1469,54 @@ console.log('Wrote my-plugin.nbpl');</code></pre>
   // nb     — namespaced invoke helper
 });</code></pre>
 <p><strong>Note:</strong> The inference renderer is shown even for untrained networks. Check <code>!!(network.state || network.stateLocked)</code> to determine whether to enable AI-dependent buttons.</p>
+
+<h3>api.registerTrainSettings(pluginKind, overrides)</h3>
+<p>Customises how the standard Training settings panel (learning rate, batch size, epochs, seed, workers) is labelled and presented for networks of this plugin kind. Pass an object keyed by field name.</p>
+<pre><code>api.registerTrainSettings('my-plugin', {
+  lr:        { label: 'Mutation std',    hint: 'Gaussian mutation standard deviation' },
+  bs:        { label: 'Population size', hint: 'Number of individuals per generation' },
+  workers:   { hidden: true },   // hide a field entirely
+  optimizer: { hidden: true },
+  sectionHint: 'Neuroevolution settings — applied when the simulation starts.',
+});</code></pre>
+<p>Each entry may contain <code>label</code>, <code>hint</code>, and <code>hidden</code>. <code>sectionHint</code> is a special key that places a small note below the Training settings header.</p>
+
+<h3>api.registerArchFields(pluginKind, spec)</h3>
+<p>Registers plugin-specific architecture fields in the <strong>Editor</strong> tab → Architecture section for networks whose <code>arch.pluginKind</code> matches <code>pluginKind</code>. Replaces the generic inputDim / outputDim / hidden-layers form with a domain-specific panel. Commonly used to expose simulation parameters (grid size, sensor count, etc.) alongside the standard hidden-layer and activation controls.</p>
+<pre><code>api.registerArchFields('my-plugin', {
+  fields: [
+    { id: 'numSensors',   label: 'Sensor count',  type: 'number',
+      default: 9,   min: 1, max: 50, step: 1,
+      hint: 'Changing this resets saved weights.' },
+    { id: 'debugOverlay', label: 'Debug overlay', type: 'boolean',    default: false },
+    { id: 'hidden',       label: 'Hidden layers', type: 'layers',     default: [64, 32] },
+    { id: 'activation',   label: 'Activation',    type: 'activation', default: 'tanh' },
+  ],
+  computeDims: (arch) => ({
+    inputDim:  arch.numSensors + 2,
+    outputDim: 2,
+  }),
+});</code></pre>
+<h4>Field descriptor properties</h4>
+<table>
+<tr><th>Property</th><th>Type</th><th>Description</th></tr>
+<tr><td><code>id</code></td><td>string</td><td>Key written into <code>network.architecture</code>. Avoid <code>inputDim</code>, <code>outputDim</code> — use <code>computeDims</code> for those.</td></tr>
+<tr><td><code>label</code></td><td>string</td><td>Human-readable label shown in the editor form.</td></tr>
+<tr><td><code>type</code></td><td>string</td><td>One of <code>'number'</code>, <code>'boolean'</code>, <code>'layers'</code>, <code>'activation'</code>.</td></tr>
+<tr><td><code>default</code></td><td>any</td><td>Value used when a network was created before this field existed (backward compatibility).</td></tr>
+<tr><td><code>min</code> / <code>max</code> / <code>step</code></td><td>number</td><td>Range constraints for <code>type: 'number'</code> fields.</td></tr>
+<tr><td><code>hint</code></td><td>string</td><td>Tooltip / help text rendered beneath the field.</td></tr>
+</table>
+<h4>Field types</h4>
+<table>
+<tr><th>type</th><th>Widget</th><th>Stored as</th></tr>
+<tr><td><code>'number'</code></td><td>Number input with min / max / step</td><td><code>arch[id]</code> — number</td></tr>
+<tr><td><code>'boolean'</code></td><td>Checkbox</td><td><code>arch[id]</code> — boolean</td></tr>
+<tr><td><code>'layers'</code></td><td>Comma-separated sizes e.g. <code>64, 32, 16</code></td><td><code>arch.hidden</code> — number[]</td></tr>
+<tr><td><code>'activation'</code></td><td>Dropdown: relu / tanh / sigmoid / linear / gelu</td><td><code>arch.activation</code> — string</td></tr>
+</table>
+<h4>computeDims callback</h4>
+<p>The optional <code>computeDims(arch)</code> function receives the full <code>arch</code> object after each edit and returns <code>{ inputDim?, outputDim? }</code>. The app uses this to detect shape mismatches between the editor values and the saved weights — if the derived dims differ from what is stored, the user is offered the option to clear stale weights before the next training run. Always implement <code>computeDims</code> when your plugin's input or output size depends on a configurable parameter.</p>
 
 <h3>api.invoke(channel, ...args)</h3>
 <p>Calls a main-process handler registered under the plugin's own <code>mainHandlers</code>. This is a convenience alias for <code>window.nb.plugins.invoke(pluginId, channel, ...args)</code>.</p>

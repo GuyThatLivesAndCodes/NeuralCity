@@ -87,6 +87,7 @@ class Storage {
           id: obj.id,
           name: obj.name,
           kind: obj.architecture?.kind,
+          pluginKind: obj.architecture?.pluginKind || null,
           createdAt: obj.createdAt,
           updatedAt: obj.updatedAt,
           encrypted: !!obj.encrypted,
