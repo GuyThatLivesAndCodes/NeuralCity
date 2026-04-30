@@ -1,49 +1,47 @@
-name: Autobuild Test App
+name: Build & Test
 
 on:
   push:
-    branches:
-      - master
+    branches: [master, "claude/**"]
   pull_request:
-    branches:
-      - master
+    branches: [master]
 
 jobs:
-  build:
-    runs-on: windows-latest
+  test:
+    name: ${{ matrix.os }} / Rust stable
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
-        cache: 'npm'
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
-    - name: Cache electron-builder binaries
-      uses: actions/cache@v4
-      with:
-        path: ~\AppData\Local\electron-builder\cache
-        key: ${{ runner.os }}-electron-builder-${{ hashFiles('package-lock.json') }}
-        restore-keys: |
-          ${{ runner.os }}-electron-builder-
+      - name: Install Linux desktop deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-cursor-dev libx11-dev libxi-dev
 
-    - name: Install Dependencies
-      run: npm install
+      - uses: Swatinem/rust-cache@v2
 
-    - name: Run Tests
-      run: npm test
+      - name: Build
+        run: cargo build --workspace --release
 
-    - name: Build Application (No Publish)
-      run: npm run build:nobump
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Test
+        run: cargo test --workspace --no-fail-fast
 
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: NeuralCabin-Build
-        path: dist/NeuralCabin-Setup-*.exe
-        retention-days: 30
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Headless XOR demo
+        run: cargo run --release -- --xor-demo

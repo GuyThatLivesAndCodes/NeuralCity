@@ -1,7 +1,0 @@
-{
-  "id": "chess",
-  "name": "Chess Model Creator",
-  "version": "1.0.0",
-  "description": "Train a neural network to predict chess moves from UCI game files. Play interactively against the AI for both white and black.",
-  "author": "NeuralCabin"
-}

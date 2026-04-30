@@ -1,0 +1,15 @@
+[package]
+name = "neuralcabin-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "NeuralCabin neural-network engine — tensors, autograd, layers, optimizers, all from scratch."
+
+[lib]
+name = "neuralcabin_engine"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

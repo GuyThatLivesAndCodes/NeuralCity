@@ -1,7 +1,0 @@
-{
-  "id": "warehouse-robot",
-  "name": "Warehouse Robot",
-  "version": "1.0.0",
-  "description": "Q-Learning (DQN) demo: a robot learns to push boxes to target locations through environment interaction. No training data needed.",
-  "author": "NeuralCabin"
-}
