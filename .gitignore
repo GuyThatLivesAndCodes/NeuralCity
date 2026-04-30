@@ -1,7 +1,8 @@
-node_modules/
-dist/
-out/
+target/
+**/*.rs.bk
+Cargo.lock.bak
 *.log
 .DS_Store
 data/
 .vscode/
+.idea/
