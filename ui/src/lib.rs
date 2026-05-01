@@ -7,6 +7,7 @@ mod app;
 mod corpus;
 mod docs;
 mod networks;
+mod paths;
 mod plot;
 mod plugins;
 mod theme;

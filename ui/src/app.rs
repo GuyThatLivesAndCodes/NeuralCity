@@ -8,6 +8,7 @@
 use crate::corpus::{Corpus, CorpusTemplate};
 use crate::docs;
 use crate::networks::{NetworkInstance, NetworkKind, NetworkStore, OptChoice};
+use crate::paths;
 use crate::plot::{scatter_2d, LinePlot};
 use crate::plugins::PluginRegistry;
 use crate::theme;
@@ -69,6 +70,8 @@ pub struct NeuralCabinApp {
     docs_section: usize,
     theme_applied: bool,
     rng: SplitMix64,
+    pending_delete: Option<u64>,
+    pending_load: Option<std::path::PathBuf>,
 }
 
 impl NeuralCabinApp {
@@ -81,6 +84,8 @@ impl NeuralCabinApp {
             docs_section: 0,
             theme_applied: false,
             rng: SplitMix64::new(0xA11CE),
+            pending_delete: None,
+            pending_load: None,
         };
         // Seed with a starter Simplex XOR network so the workbench has
         // something to look at on first launch.
@@ -139,6 +144,14 @@ impl eframe::App for NeuralCabinApp {
         if !self.theme_applied {
             theme::apply(ctx);
             self.theme_applied = true;
+        }
+        if let Some(id) = self.pending_delete.take() {
+            self.store.remove(id);
+        }
+        if let Some(path) = self.pending_load.take() {
+            if let Some(net) = self.store.active_mut() {
+                load_active(net, &path);
+            }
         }
         if self.any_training() {
             ctx.request_repaint_after(Duration::from_millis(75));
@@ -323,13 +336,13 @@ impl NeuralCabinApp {
     fn networks_tab(&mut self, ui: &mut egui::Ui) {
         egui::SidePanel::left("networks_list")
             .resizable(true)
-            .default_width(260.0)
+            .default_width(240.0)
             .show_inside(ui, |ui| {
                 ui.add_space(4.0);
                 if ui
-                    .add_sized(
-                        [ui.available_width(), 30.0],
-                        egui::Button::new(RichText::new("＋  Create Network").strong()),
+                    .add(
+                        egui::Button::new(RichText::new("＋  Create Network").strong())
+                            .min_size(egui::vec2(ui.available_width(), 28.0)),
                     )
                     .clicked()
                 {
@@ -346,32 +359,31 @@ impl NeuralCabinApp {
                     .map(|n| (n.id, n.name.clone(), n.kind.label()))
                     .collect();
                 let mut to_select: Option<u64> = None;
-                let mut to_remove: Option<u64> = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (id, name, kind) in entries {
                         let selected = active == Some(id);
-                        ui.horizontal(|ui| {
-                            let mut label = RichText::new(format!("◆  {name}")).size(13.5);
-                            if selected { label = label.color(theme::ACCENT).strong(); }
-                            if ui
-                                .add_sized(
-                                    [ui.available_width() - 28.0, 28.0],
-                                    egui::Button::new(label).frame(selected),
-                                )
-                                .clicked()
-                            {
-                                to_select = Some(id);
-                            }
-                            if ui.small_button("✕").on_hover_text("Delete network").clicked() {
-                                to_remove = Some(id);
-                            }
-                        });
-                        ui.label(RichText::new(format!("    {kind}")).color(theme::TEXT_WEAK).size(11.0));
+                        let mut text = RichText::new(format!("◆  {name}")).size(13.5);
+                        if selected { text = text.color(theme::ACCENT).strong(); }
+                        let avail = ui.available_width();
+                        if ui
+                            .add(
+                                egui::Button::new(text)
+                                    .frame(selected)
+                                    .min_size(egui::vec2(avail, 24.0)),
+                            )
+                            .clicked()
+                        {
+                            to_select = Some(id);
+                        }
+                        ui.label(
+                            RichText::new(format!("    {kind}"))
+                                .color(theme::TEXT_WEAK)
+                                .size(11.0),
+                        );
                         ui.add_space(2.0);
                     }
                 });
                 if let Some(id) = to_select { self.store.select(id); }
-                if let Some(id) = to_remove { self.store.remove(id); }
 
                 if self.create.open {
                     ui.add_space(8.0);
@@ -442,6 +454,13 @@ impl NeuralCabinApp {
     }
 
     fn network_editor(&mut self, ui: &mut egui::Ui) {
+        let active_id = self.store.active;
+        let saved = paths::list_saved_networks().unwrap_or_default();
+        let storage_path = paths::networks_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|e| format!("(unavailable: {e})"));
+        let pending_delete = &mut self.pending_delete;
+        let pending_load = &mut self.pending_load;
         let Some(net) = self.store.active_mut() else {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -454,6 +473,15 @@ impl NeuralCabinApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new(&net.name).size(20.0).strong());
             ui.label(RichText::new(net.kind.label()).color(theme::TEXT_WEAK));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(RichText::new("✕  Delete network").color(theme::TEXT_WEAK))
+                    .on_hover_text("Remove this network from the workspace")
+                    .clicked()
+                {
+                    if let Some(id) = active_id { *pending_delete = Some(id); }
+                }
+            });
         });
         theme::hairline(ui);
         ui.add_space(4.0);
@@ -563,15 +591,48 @@ impl NeuralCabinApp {
 
         ui.add_space(10.0);
         theme::section_heading(ui, "Persistence");
+        let stem = paths::sanitize_filename(&net.name);
+        ui.label(
+            RichText::new(format!("File: {stem}.json"))
+                .color(theme::TEXT_WEAK)
+                .size(11.5),
+        );
+        ui.label(
+            RichText::new(format!("Location: {storage_path}"))
+                .color(theme::TEXT_FAINT)
+                .size(11.0),
+        );
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label("Path:");
-            ui.add(egui::TextEdit::singleline(&mut net.model_path).desired_width(280.0));
+            if ui
+                .button(RichText::new("💾  Save").strong())
+                .on_hover_text("Save this network into the app data folder")
+                .clicked()
+            {
+                save_active(net);
+            }
+            let load_label = if saved.is_empty() {
+                "Load… (none saved)".to_string()
+            } else {
+                "Load saved network…".to_string()
+            };
+            egui::ComboBox::from_id_salt("load_saved_pick")
+                .selected_text(load_label)
+                .show_ui(ui, |ui| {
+                    if saved.is_empty() {
+                        ui.label(
+                            RichText::new("(no saved networks yet)")
+                                .color(theme::TEXT_FAINT),
+                        );
+                    } else {
+                        for (name, path) in &saved {
+                            if ui.selectable_label(false, name).clicked() {
+                                *pending_load = Some(path.clone());
+                            }
+                        }
+                    }
+                });
         });
-        let (save_clicked, load_clicked) = ui.horizontal(|ui| {
-            (ui.button("Save").clicked(), ui.button("Load").clicked())
-        }).inner;
-        if save_clicked { save_active(net); }
-        if load_clicked { load_active(net); }
         if let Some(m) = &net.persistence_message {
             ui.label(RichText::new(m).color(theme::TEXT_WEAK).size(11.5));
         }
@@ -583,15 +644,24 @@ fn save_active(net: &mut NetworkInstance) {
         net.persistence_message = Some("No model to save.".into());
         return;
     };
+    let dir = match paths::networks_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            net.persistence_message = Some(format!("appdata error: {e}"));
+            return;
+        }
+    };
+    let stem = paths::sanitize_filename(&net.name);
+    let path = dir.join(format!("{stem}.json"));
     let file = ModelFile::wrap(model.clone(), Some(net.loss_choice), Some(net.current_optimizer()));
-    match persistence::save(&net.model_path, &file) {
-        Ok(()) => net.persistence_message = Some(format!("Saved → {}", net.model_path)),
+    match persistence::save(&path, &file) {
+        Ok(()) => net.persistence_message = Some(format!("Saved → {}", path.display())),
         Err(e) => net.persistence_message = Some(format!("Save failed: {e}")),
     }
 }
 
-fn load_active(net: &mut NetworkInstance) {
-    match persistence::load(&net.model_path) {
+fn load_active(net: &mut NetworkInstance, path: &std::path::Path) {
+    match persistence::load(path) {
         Ok(f) => {
             net.input_dim = f.model.input_dim;
             net.layer_specs = f
@@ -608,7 +678,10 @@ fn load_active(net: &mut NetworkInstance) {
             if let Some(o) = f.optimizer { net.set_optimizer(o); }
             net.inference_inputs = vec![0.0; f.model.input_dim];
             net.model = Some(f.model);
-            net.persistence_message = Some(format!("Loaded ← {}", net.model_path));
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if !stem.is_empty() { net.name = stem.to_string(); }
+            }
+            net.persistence_message = Some(format!("Loaded ← {}", path.display()));
         }
         Err(e) => net.persistence_message = Some(format!("Load failed: {e}")),
     }

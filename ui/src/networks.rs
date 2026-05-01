@@ -82,7 +82,6 @@ pub struct NetworkInstance {
     pub max_tokens: usize,
 
     // Persistence.
-    pub model_path: String,
     pub persistence_message: Option<String>,
 }
 
@@ -172,7 +171,6 @@ impl NetworkInstance {
             generated: String::new(),
             temperature: 0.8,
             max_tokens: 64,
-            model_path: format!("{name_safe}.json", name_safe = "model"),
             persistence_message: None,
         }
     }
