@@ -29,6 +29,29 @@ impl VocabMode {
         }
     }
 
+    pub fn to_str(self) -> &'static str {
+        match self {
+            VocabMode::Char     => "Char",
+            VocabMode::Subword  => "Subword",
+            VocabMode::Word     => "Word",
+            VocabMode::Sentence => "Sentence",
+            VocabMode::Bulk     => "Bulk",
+            VocabMode::Custom   => "Custom",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "Char"     => Some(VocabMode::Char),
+            "Subword"  => Some(VocabMode::Subword),
+            "Word"     => Some(VocabMode::Word),
+            "Sentence" => Some(VocabMode::Sentence),
+            "Bulk"     => Some(VocabMode::Bulk),
+            "Custom"   => Some(VocabMode::Custom),
+            _          => None,
+        }
+    }
+
     pub fn all() -> &'static [VocabMode] {
         &[
             VocabMode::Char,

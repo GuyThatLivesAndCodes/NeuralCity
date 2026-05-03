@@ -4,6 +4,7 @@
 //! corpus is a numeric `Dataset`; for next-token-generation networks it is a
 //! body of text plus an arbitrary set of uploaded files.
 
+use crate::networks::EmbeddingKind;
 use crate::vocab::Vocab;
 use neuralcabin_engine::data::{self, Dataset, TaskKind};
 use neuralcabin_engine::tensor::Tensor;
@@ -219,8 +220,21 @@ impl Corpus {
         ));
     }
 
-    /// Build a next-token-prediction `Dataset` from the encoded token stream.
-    pub fn build_text_dataset(&mut self, vocab: &Vocab) -> Result<Arc<Dataset>, String> {
+    /// Build a next-token-prediction `Dataset` using the selected embedding.
+    ///
+    /// - **OneHot / TfIdf**: input_dim = ctx × vocab_size
+    /// - **FastText / Transformer**: input_dim = ctx × embed_dim
+    ///
+    /// `seed` is used only to initialise the random embedding table for
+    /// FastText / Transformer; it must equal `NetworkInstance::seed` so the
+    /// same table is used at inference time.
+    pub fn build_text_dataset(
+        &mut self,
+        vocab: &Vocab,
+        embedding: EmbeddingKind,
+        embed_dim: usize,
+        seed: u64,
+    ) -> Result<Arc<Dataset>, String> {
         if self.encoded_tokens.is_empty() {
             self.retokenise(vocab);
         }
@@ -231,8 +245,29 @@ impl Corpus {
             return Err(format!("not enough tokens ({}) for context {}", toks.len(), ctx));
         }
         let n = toks.len() - ctx;
+
+        let ds = match embedding {
+            EmbeddingKind::OneHot => self.build_onehot(toks, n, ctx, v),
+            EmbeddingKind::TfIdf  => self.build_tfidf(toks, n, ctx, v),
+            EmbeddingKind::FastText   => self.build_dense(toks, n, ctx, v, embed_dim, seed, false),
+            EmbeddingKind::Transformer=> self.build_dense(toks, n, ctx, v, embed_dim, seed, true),
+        };
+
+        let arc = Arc::new(ds);
+        self.dataset = Some(arc.clone());
+        let in_dim = arc.n_features();
+        self.message = Some(format!(
+            "Built {} training samples · in_dim {} · vocab {} · embedding: {}.",
+            n, in_dim, v, embedding.name()
+        ));
+        Ok(arc)
+    }
+
+    // ── One-Hot ───────────────────────────────────────────────────────────────
+
+    fn build_onehot(&self, toks: &[usize], n: usize, ctx: usize, v: usize) -> Dataset {
         let in_dim = ctx * v;
-        let mut feats = vec![0.0_f32; n * in_dim];
+        let mut feats  = vec![0.0_f32; n * in_dim];
         let mut labels = vec![0.0_f32; n * v];
         for i in 0..n {
             for k in 0..ctx {
@@ -242,19 +277,122 @@ impl Corpus {
             let target = toks[i + ctx].min(v - 1);
             labels[i * v + target] = 1.0;
         }
-        let ds = Dataset {
-            feature_names: (0..in_dim).map(|i| format!("ctx{i}")).collect(),
-            label_names: (0..v).map(|i| format!("tok{i}")).collect(),
-            features: Tensor::new(vec![n, in_dim], feats),
-            labels: Tensor::new(vec![n, v], labels),
-            task: TaskKind::Classification { num_classes: v },
-        };
-        let arc = Arc::new(ds);
-        self.dataset = Some(arc.clone());
-        self.message = Some(format!(
-            "Built {} training samples · in_dim {} · vocab {}.",
-            n, in_dim, v
-        ));
-        Ok(arc)
+        make_dataset(n, in_dim, v, feats, labels)
+    }
+
+    // ── TF-IDF ────────────────────────────────────────────────────────────────
+    // Each token's weight = ln(1 + total_tokens / count[token]).
+    // Rare tokens get higher weight; common tokens are downweighted.
+
+    fn build_tfidf(&self, toks: &[usize], n: usize, ctx: usize, v: usize) -> Dataset {
+        // Compute IDF from the entire corpus.
+        let total = toks.len() as f32;
+        let mut counts = vec![0usize; v];
+        for &t in toks { counts[t.min(v - 1)] += 1; }
+        let idf: Vec<f32> = counts.iter()
+            .map(|&c| if c == 0 { 0.0 } else { (1.0 + total / c as f32).ln() })
+            .collect();
+
+        let in_dim = ctx * v;
+        let mut feats  = vec![0.0_f32; n * in_dim];
+        let mut labels = vec![0.0_f32; n * v];
+        for i in 0..n {
+            for k in 0..ctx {
+                let id = toks[i + k].min(v - 1);
+                feats[i * in_dim + k * v + id] = idf[id];
+            }
+            let target = toks[i + ctx].min(v - 1);
+            labels[i * v + target] = 1.0;
+        }
+        make_dataset(n, in_dim, v, feats, labels)
+    }
+
+    // ── Dense embeddings (FastText / Transformer) ─────────────────────────────
+    // A random embedding matrix E[vocab_size × embed_dim] is seeded from
+    // `seed`, so inference later can reconstruct the same table cheaply.
+    // For Transformer mode we add sinusoidal positional encoding.
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_dense(
+        &self,
+        toks: &[usize],
+        n: usize,
+        ctx: usize,
+        v: usize,
+        embed_dim: usize,
+        seed: u64,
+        positional: bool,
+    ) -> Dataset {
+        let e = embed_dim.max(1);
+        let emb = random_embedding_table(v, e, seed);
+
+        let in_dim = ctx * e;
+        let mut feats  = vec![0.0_f32; n * in_dim];
+        let mut labels = vec![0.0_f32; n * v];
+        for i in 0..n {
+            for k in 0..ctx {
+                let id = toks[i + k].min(v - 1);
+                let row = &emb[id * e..(id + 1) * e];
+                let base = i * in_dim + k * e;
+                for d in 0..e {
+                    let mut val = row[d];
+                    if positional {
+                        val += positional_enc(k, d, e);
+                    }
+                    feats[base + d] = val;
+                }
+            }
+            let target = toks[i + ctx].min(v - 1);
+            labels[i * v + target] = 1.0;
+        }
+        make_dataset(n, in_dim, v, feats, labels)
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn make_dataset(n: usize, in_dim: usize, v: usize, feats: Vec<f32>, labels: Vec<f32>) -> Dataset {
+    Dataset {
+        feature_names: (0..in_dim).map(|i| format!("f{i}")).collect(),
+        label_names:   (0..v).map(|i| format!("tok{i}")).collect(),
+        features: Tensor::new(vec![n, in_dim], feats),
+        labels:   Tensor::new(vec![n, v], labels),
+        task: TaskKind::Classification { num_classes: v },
+    }
+}
+
+/// Build a (vocab × embed_dim) embedding table using a simple PRNG seeded by
+/// `seed`. Values are in [-0.5, 0.5] (Xavier-ish range for small models).
+pub fn random_embedding_table(vocab: usize, embed_dim: usize, seed: u64) -> Vec<f32> {
+    let n = vocab * embed_dim;
+    let mut out = Vec::with_capacity(n);
+    let mut s = seed ^ 0x9E3779B97F4A7C15;
+    for _ in 0..n {
+        // xorshift64
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let f = (s as f32) / (u64::MAX as f32) - 0.5;
+        out.push(f);
+    }
+    out
+}
+
+/// Sinusoidal positional encoding PE(pos, dim, embed_dim).
+/// Exposed for the inference path in app.rs.
+#[inline]
+pub fn positional_enc_pub(pos: usize, dim: usize, embed_dim: usize) -> f32 {
+    positional_enc(pos, dim, embed_dim)
+}
+
+#[inline]
+fn positional_enc(pos: usize, dim: usize, embed_dim: usize) -> f32 {
+    let d = embed_dim.max(2) as f32;
+    let exponent = (dim as f32 / d).floor() * 2.0 / d;
+    let denom = 10000.0_f32.powf(exponent);
+    if dim.is_multiple_of(2) {
+        (pos as f32 / denom).sin()
+    } else {
+        (pos as f32 / denom).cos()
     }
 }
