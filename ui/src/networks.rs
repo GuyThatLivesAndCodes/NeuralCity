@@ -25,6 +25,29 @@ impl NetworkKind {
             }
         }
     }
+
+    pub fn to_persist_string(&self) -> String {
+        match self {
+            NetworkKind::Simplex => "Simplex".into(),
+            NetworkKind::NextTokenGen => "NextTokenGen".into(),
+            NetworkKind::Plugin { plugin_id, type_name } => {
+                format!("Plugin:{plugin_id}:{type_name}")
+            }
+        }
+    }
+
+    pub fn from_persist_string(s: &str) -> Self {
+        if s == "NextTokenGen" {
+            NetworkKind::NextTokenGen
+        } else if let Some(rest) = s.strip_prefix("Plugin:") {
+            let mut parts = rest.splitn(2, ':');
+            let pid = parts.next().unwrap_or("").to_string();
+            let ty  = parts.next().unwrap_or("").to_string();
+            NetworkKind::Plugin { plugin_id: pid, type_name: ty }
+        } else {
+            NetworkKind::Simplex
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -34,6 +57,82 @@ impl OptChoice {
     #[allow(dead_code)]
     pub fn name(&self) -> &'static str {
         match self { OptChoice::Sgd => "SGD", OptChoice::Adam => "Adam" }
+    }
+}
+
+/// How the text corpus is converted into numeric vectors before being fed to
+/// the MLP. All modes are implemented in pure Rust — no external model
+/// downloads required.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EmbeddingKind {
+    /// One-hot sparse vector per context position.
+    /// Input dim = ctx × vocab_size.
+    OneHot,
+
+    /// TF-IDF weighted vector per context position.
+    /// Rare tokens receive higher weight; input dim = ctx × vocab_size.
+    TfIdf,
+
+    /// Random dense embedding lookup (FastText / Word2Vec style).
+    /// Embeddings are initialised from the network seed and trained end-to-end.
+    /// Input dim = ctx × embed_dim.
+    FastText,
+
+    /// Same as FastText but with sinusoidal positional encoding added
+    /// (Transformer-style). Input dim = ctx × embed_dim.
+    Transformer,
+}
+
+impl EmbeddingKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            EmbeddingKind::OneHot     => "One-Hot",
+            EmbeddingKind::TfIdf      => "TF-IDF",
+            EmbeddingKind::FastText   => "FastText / Word2Vec",
+            EmbeddingKind::Transformer=> "Transformer (positional)",
+        }
+    }
+
+    pub fn all() -> &'static [EmbeddingKind] {
+        &[
+            EmbeddingKind::OneHot,
+            EmbeddingKind::TfIdf,
+            EmbeddingKind::FastText,
+            EmbeddingKind::Transformer,
+        ]
+    }
+
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            EmbeddingKind::OneHot      => "OneHot",
+            EmbeddingKind::TfIdf       => "TfIdf",
+            EmbeddingKind::FastText    => "FastText",
+            EmbeddingKind::Transformer => "Transformer",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "TfIdf"       => EmbeddingKind::TfIdf,
+            "FastText"    => EmbeddingKind::FastText,
+            "Transformer" => EmbeddingKind::Transformer,
+            _             => EmbeddingKind::OneHot,
+        }
+    }
+
+    /// Returns true when this embedding produces input_dim = ctx * embed_dim
+    /// rather than ctx * vocab_size.
+    pub fn uses_dense_embed(&self) -> bool {
+        matches!(self, EmbeddingKind::FastText | EmbeddingKind::Transformer)
+    }
+
+    /// Compute input_dim from context, vocab, and embed_dim.
+    pub fn input_dim(&self, ctx: usize, vocab: usize, embed_dim: usize) -> usize {
+        if self.uses_dense_embed() {
+            ctx * embed_dim
+        } else {
+            ctx * vocab
+        }
     }
 }
 
@@ -54,6 +153,10 @@ pub struct NetworkInstance {
     // Corpus + vocab.
     pub corpus: Corpus,
     pub vocab: Vocab,
+
+    // Text embedding settings.
+    pub embedding_kind: EmbeddingKind,
+    pub embed_dim: usize,
 
     // Training hyperparameters.
     pub loss_choice: Loss,
@@ -151,6 +254,8 @@ impl NetworkInstance {
             pending_activation: Activation::ReLU,
             corpus: Corpus::default(),
             vocab: Vocab::default(),
+            embedding_kind: EmbeddingKind::OneHot,
+            embed_dim: 32,
             loss_choice: Loss::MeanSquaredError,
             opt_choice: OptChoice::Adam,
             learning_rate: 0.05,
@@ -247,6 +352,22 @@ impl NetworkInstance {
             }
         }
     }
+
+    /// Recompute input_dim from vocab/context/embedding settings.
+    /// Call this whenever vocab size, context size, or embedding kind changes.
+    pub fn sync_text_dims(&mut self) {
+        if !matches!(self.kind, NetworkKind::NextTokenGen) { return; }
+        let v = self.vocab.len().max(1);
+        let ctx = self.corpus.context_size.max(1);
+        let new_in = self.embedding_kind.input_dim(ctx, v, self.embed_dim);
+        self.set_input_dim(new_in);
+        self.set_output_dim(v);
+    }
+
+    /// Index of the last `Linear` layer spec, if any.
+    pub fn last_linear_idx(&self) -> Option<usize> {
+        self.layer_specs.iter().rposition(|s| matches!(s, LayerSpec::Linear { .. }))
+    }
 }
 
 #[derive(Default)]
@@ -257,11 +378,24 @@ pub struct NetworkStore {
 }
 
 impl NetworkStore {
+    /// Add a new network, call `build_model`, set it active if nothing is.
     pub fn add(&mut self, mut net: NetworkInstance) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         net.id = id;
         net.build_model();
+        self.list.push(net);
+        if self.active.is_none() { self.active = Some(id); }
+        id
+    }
+
+    /// Add a network that already has a trained model — skip `build_model` so
+    /// the loaded weights are preserved.
+    pub fn add_loaded(&mut self, mut net: NetworkInstance) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        net.id = id;
+        if net.model.is_none() { net.build_model(); }
         self.list.push(net);
         if self.active.is_none() { self.active = Some(id); }
         id
