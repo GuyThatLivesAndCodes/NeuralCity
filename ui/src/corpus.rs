@@ -312,6 +312,7 @@ impl Corpus {
     // `seed`, so inference later can reconstruct the same table cheaply.
     // For Transformer mode we add sinusoidal positional encoding.
 
+    #[allow(clippy::too_many_arguments)]
     fn build_dense(
         &self,
         toks: &[usize],
@@ -389,7 +390,7 @@ fn positional_enc(pos: usize, dim: usize, embed_dim: usize) -> f32 {
     let d = embed_dim.max(2) as f32;
     let exponent = (dim as f32 / d).floor() * 2.0 / d;
     let denom = 10000.0_f32.powf(exponent);
-    if dim % 2 == 0 {
+    if dim.is_multiple_of(2) {
         (pos as f32 / denom).sin()
     } else {
         (pos as f32 / denom).cos()

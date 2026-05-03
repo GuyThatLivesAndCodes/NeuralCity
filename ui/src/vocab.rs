@@ -29,7 +29,7 @@ impl VocabMode {
         }
     }
 
-    pub fn to_str(&self) -> &'static str {
+    pub fn to_str(self) -> &'static str {
         match self {
             VocabMode::Char     => "Char",
             VocabMode::Subword  => "Subword",

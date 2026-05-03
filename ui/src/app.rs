@@ -572,9 +572,7 @@ impl NeuralCabinApp {
                                 });
                         }
                     }
-                    if !locked {
-                        if ui.small_button("✕").clicked() { to_remove = Some(i); }
-                    }
+                    if !locked && ui.small_button("✕").clicked() { to_remove = Some(i); }
                 });
             });
         }
@@ -1500,7 +1498,7 @@ fn generate_text(net: &mut NetworkInstance) -> Result<String, String> {
 
     for _ in 0..net.max_tokens {
         let input_vec = build_input_vec(
-            &history, ctx, v, edim, emb, emb_table.as_deref(), &idf, seed,
+            &history, ctx, v, edim, emb, emb_table.as_deref(), &idf,
         );
         let logits = model.predict(&Tensor::new(vec![1, expected_in], input_vec));
         // Temperature-scaled softmax.
@@ -1540,7 +1538,6 @@ fn build_input_vec(
     emb: EmbeddingKind,
     emb_table: Option<&[f32]>,
     idf: &[f32],
-    _seed: u64,
 ) -> Vec<f32> {
     use crate::corpus::positional_enc_pub;
 
