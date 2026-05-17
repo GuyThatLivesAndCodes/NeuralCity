@@ -362,8 +362,17 @@ export const servers = {
   status: (id: string)                => invoke<ServerSummary>('server_status', { id }),
 }
 
+export interface InferActivations {
+  layer_names: string[]
+  activations: number[][]
+  dims: number[]
+}
+
 export const inference = {
   run:    (req: InferRequest) => invoke<InferResponse>('infer', { req }),
+  /** Forward pass that also returns activations after every layer. Feed-forward only. */
+  runWithActivations: (network_id: string, features: number[]) =>
+    invoke<InferActivations>('infer_with_activations', { networkId: network_id, features }),
   stop:   (inferenceId: string) => invoke<boolean>('stop_inference', { inferenceId }),
 
   onToken:    (handler: (t: InferenceToken) => void): Promise<UnlistenFn> =>

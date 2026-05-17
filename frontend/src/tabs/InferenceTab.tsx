@@ -2,11 +2,17 @@ import { useEffect, useRef, useState } from 'react'
 import { type UnlistenFn } from '@tauri-apps/api/event'
 import { inference, vocabulary, corpus, Network, InferenceToken, CorpusStats } from '../api'
 import type { TabProps } from '../App'
+import NetworkViz from '../components/NetworkViz'
+import PluginErrorBoundary from '../components/PluginErrorBoundary'
 
-export default function InferenceTab({ network }: TabProps) {
+export default function InferenceTab({ network, pluginRegistry }: TabProps) {
   const [error, setError] = useState<string | null>(null)
   const [corpusStats, setCorpusStats] = useState<CorpusStats | null>(null)
 
+  // IMPORTANT: every hook in this component must run on every render. The
+  // conditional early-return for plugin-managed networks lives *after* the
+  // hooks; otherwise switching between a plugin-managed and a built-in
+  // network changes the hook call count and React tears the tree down.
   useEffect(() => {
     if (!network) {
       setCorpusStats(null)
@@ -22,6 +28,26 @@ export default function InferenceTab({ network }: TabProps) {
     }
     void fetch()
   }, [network?.id])
+
+  // Plugin-managed networks own their own inference UI. Must come AFTER all
+  // hooks above so hook ordering stays stable across network-type switches.
+  const pluginType = network && pluginRegistry?.typeForNetwork(network.id)
+  if (network && pluginType?.type.InferenceUI) {
+    const PluginInference = pluginType.type.InferenceUI
+    return (
+      <div className="tab-content">
+        <h2>Inference</h2>
+        <p className="muted">
+          Managed by plugin <strong>{pluginType.plugin.name}</strong> · type <strong>{pluginType.type.label}</strong>.
+        </p>
+        <PluginErrorBoundary
+          key={`${pluginType.plugin.id}:${network.id}`}
+          fallbackTitle={`${pluginType.plugin.name} inference UI crashed`}>
+          <PluginInference network={network} context={pluginRegistry!.context} />
+        </PluginErrorBoundary>
+      </div>
+    )
+  }
 
   const isFinetuned = network?.kind === 'next_token' && corpusStats?.stage === 'finetune'
 
@@ -517,10 +543,13 @@ function FeedforwardInference({ network, onError }: {
 }) {
   const [inputs, setInputs] = useState<string[]>(() => Array(network.input_dim).fill('0'))
   const [output, setOutput] = useState<number[] | null>(null)
+  const [activations, setActivations] = useState<{ names: string[]; data: number[][] } | null>(null)
+  const [showViz, setShowViz] = useState(true)
   const [busy, setBusy] = useState(false)
 
-  useEffect(() => { setInputs(Array(network.input_dim).fill('0')); setOutput(null) },
-    [network.id, network.input_dim])
+  useEffect(() => {
+    setInputs(Array(network.input_dim).fill('0')); setOutput(null); setActivations(null)
+  }, [network.id, network.input_dim])
 
   const setVal = (i: number, v: string) =>
     setInputs(prev => prev.map((x, idx) => idx === i ? v : x))
@@ -534,8 +563,9 @@ function FeedforwardInference({ network, onError }: {
     }
     setBusy(true)
     try {
-      const r = await inference.run({ network_id: network.id, features })
-      setOutput(r.output ?? null)
+      const r = await inference.runWithActivations(network.id, features)
+      setActivations({ names: r.layer_names, data: r.activations })
+      setOutput(r.activations[r.activations.length - 1] ?? null)
     } catch (e) { onError(String(e)) }
     finally { setBusy(false) }
   }
@@ -552,10 +582,14 @@ function FeedforwardInference({ network, onError }: {
             </div>
           ))}
         </div>
-        <div className="flex mt-2">
+        <div className="flex mt-2" style={{ gap: 12, alignItems: 'center' }}>
           <button onClick={run} disabled={busy}>
             {busy ? 'Running...' : 'Predict'}
           </button>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input type="checkbox" checked={showViz} onChange={e => setShowViz(e.target.checked)} />
+            Show network
+          </label>
         </div>
       </div>
 
@@ -570,6 +604,19 @@ function FeedforwardInference({ network, onError }: {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {showViz && activations && (
+        <div className="card">
+          <h3>Network</h3>
+          <p className="muted">Neuron activations after the most recent forward pass.</p>
+          <NetworkViz
+            layerNames={activations.names}
+            activations={activations.data}
+            inputLabels={inputs.map((_, i) => `x${i}`)}
+            outputLabels={output ? output.map((_, i) => `y${i}`) : undefined}
+          />
         </div>
       )}
     </>

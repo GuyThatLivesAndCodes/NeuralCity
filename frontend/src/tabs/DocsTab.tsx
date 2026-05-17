@@ -77,8 +77,107 @@ export default function DocsTab({ networks: list }: { networks: Network[] }) {
               Loss curves stream live as the model trains.</li>
           <li><strong>Inference tab</strong>: feed inputs (or a prompt) to a
               trained network. For next-token networks you also get per-token
-              probabilities for transparency.</li>
+              probabilities for transparency. For feed-forward networks (and
+              plugin-managed network types) the inference view also renders the
+              <strong> network itself</strong> — every neuron's activation after
+              the most recent forward pass, color-coded by magnitude.</li>
+          <li><strong>Plugins tab</strong>: install, enable, or upload plugins
+              that contribute brand-new network types. Plugin types appear in
+              the same Type dropdown as the built-in ones on the Networks tab.</li>
         </ol>
+      </div>
+
+      <div className="card">
+        <h3>Network visualization (Inference tab)</h3>
+        <p>
+          For any feed-forward network — built-in or plugin-contributed — the
+          Inference tab can render the network as a column of neurons per
+          layer, colored by their activation after the most recent forward
+          pass. Hover a neuron to see its exact value. Layers wider than a
+          handful of neurons are sampled so the view stays readable.
+        </p>
+        <p className="muted small mt-1">
+          Backed by a Tauri command <code>infer_with_activations</code> that
+          runs the same forward path used by training but captures the output
+          of every layer. Next-token / transformer networks don't surface the
+          visualization yet because their inference streams tokens.
+        </p>
+      </div>
+
+      <div className="card">
+        <h3>Plugins</h3>
+        <p>
+          Plugins extend NeuralCabin with new network types. A plugin owns the
+          create form, the corpus UI, and the inference UI for its types —
+          under the hood it usually creates a normal feed-forward network and
+          stores its own metadata per network, but to the rest of the app the
+          new type is a first-class citizen alongside feed-forward,
+          next-token, and transformer.
+        </p>
+        <p>
+          A plugin is a JS module whose default export is a plugin object:
+        </p>
+        <pre style={{
+          background: 'var(--bg-input)', padding: 12, borderRadius: 'var(--radius)',
+          border: '1px solid var(--border)', overflow: 'auto', fontSize: 12,
+        }}>{`export default {
+  id:      'com.example.my-plugin',
+  name:    'My Plugin',
+  version: '0.1.0',
+  description: 'Adds a new network type.',
+  networkTypes: [{
+    id: 'my-type',
+    label: 'My Type',
+    description: 'What this type is good for.',
+    CreateForm,            // React component: builds + creates a network
+    CorpusUI:    CorpusUI, // optional: replaces the default Corpus tab
+    InferenceUI: InferUI,  // optional: replaces the default Inference tab
+  }],
+}`}</pre>
+        <p className="mt-2">
+          Plugins are loaded as ES modules into the same JS realm as the host
+          (no sandbox), so installing a plugin is a trust decision — only
+          install plugins you actually trust.
+        </p>
+        <p className="muted small mt-1">
+          A future curated <strong>NeuralCabin Marketplace</strong>, backed by
+          Cloudflare, will host signed plugins for one-click install. The
+          Plugins tab already shows the placeholder.
+        </p>
+      </div>
+
+      <div className="card">
+        <h3>Built-in plugin: Image Classification</h3>
+        <p>
+          Ships enabled out of the box and adds an <strong>Image Classification</strong>
+          type to the Networks Type dropdown. Configurable image size (X / Y),
+          color mode (grayscale or RGB), hidden-layer spec, output activation,
+          and seed — under the hood it's a feed-forward MLP with{' '}
+          <code>X · Y · channels</code> inputs and one output neuron per class.
+        </p>
+        <ul style={{ paddingLeft: 20, lineHeight: 1.7 }}>
+          <li><strong>Corpus:</strong> add text class labels, then attach
+              samples by uploading images (auto-resized to the network's input
+              dims) or by drawing on the built-in canvas. The canvas adapts
+              to grayscale vs. RGB and exposes a color picker in RGB mode.</li>
+          <li><strong>Output-dim drift:</strong> if you add more classes than
+              the network was created with, the plugin rebuilds the underlying
+              network at save time and migrates your samples — unless the
+              network has already been trained, in which case it refuses to
+              silently discard your weights.</li>
+          <li><strong>Training:</strong> uses the standard Training tab — it's
+              just a feed-forward model.</li>
+          <li><strong>Inference:</strong> draw an image or upload one and the
+              plugin predicts a class. Enable <em>real-time inference</em> to
+              run a forward pass on every stroke (queued so it never piles up),
+              with the network-viz updating live.</li>
+        </ul>
+        <p className="muted small mt-1">
+          Per-network samples are stored in IndexedDB rather than localStorage,
+          because RGB samples (e.g. 64×64×3 ≈ 12k floats) blow past the
+          localStorage quota fast. Class lists, dims, and hyperparams stay in
+          localStorage where they fit comfortably.
+        </p>
       </div>
 
       <div className="card">

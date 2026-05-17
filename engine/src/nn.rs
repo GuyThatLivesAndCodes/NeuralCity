@@ -233,6 +233,21 @@ impl Model {
         x
     }
 
+    /// CPU forward that returns the activation after each layer in addition
+    /// to the final output. Includes the input as the first entry so callers
+    /// can render a full neuron-by-neuron view of the network.
+    /// Returned tensors all have shape (batch, dim_i).
+    pub fn predict_with_activations(&self, input: &Tensor) -> Vec<Tensor> {
+        let mut acts = Vec::with_capacity(self.layers.len() + 1);
+        acts.push(input.clone());
+        let mut x = input.clone();
+        for l in &self.layers {
+            x = l.forward_eager(&x);
+            acts.push(x.clone());
+        }
+        acts
+    }
+
     /// One training step on a `(input, target)` batch using the CPU autodiff
     /// backend. Returns the scalar loss.
     ///

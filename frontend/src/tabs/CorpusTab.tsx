@@ -4,20 +4,45 @@ import {
   CorpusStats, Stage, Network,
 } from '../api'
 import type { TabProps } from '../App'
+import PluginErrorBoundary from '../components/PluginErrorBoundary'
 
-export default function CorpusTab({ network }: TabProps) {
+export default function CorpusTab({ network, pluginRegistry }: TabProps) {
   const [stats, setStats] = useState<CorpusStats | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(null)
+
+  // Declared before the useEffect so the effect's closure isn't stuck in the
+  // const's temporal dead zone when this component takes its plugin-managed
+  // early-return path (the effect still runs after commit either way; if it
+  // referenced `loadStats` while that declaration had been skipped, accessing
+  // it from the effect would throw ReferenceError and blank the entire app).
+  const loadStats = async (id: string) => {
+    try { setStats(await corpus.stats(id)) }
+    catch (e) { setStats(null); setError(String(e)) }
+  }
 
   useEffect(() => {
     if (network) void loadStats(network.id)
     else setStats(null)
   }, [network])
 
-  const loadStats = async (id: string) => {
-    try { setStats(await corpus.stats(id)) }
-    catch (e) { setStats(null); setError(String(e)) }
+  // Plugin-managed networks own their own corpus UI.
+  const pluginType = network && pluginRegistry?.typeForNetwork(network.id)
+  if (network && pluginType?.type.CorpusUI) {
+    const PluginCorpus = pluginType.type.CorpusUI
+    return (
+      <div className="tab-content">
+        <h2>Corpus</h2>
+        <p className="muted">
+          Managed by plugin <strong>{pluginType.plugin.name}</strong> · type <strong>{pluginType.type.label}</strong>.
+        </p>
+        <PluginErrorBoundary
+          key={`${pluginType.plugin.id}:${network.id}`}
+          fallbackTitle={`${pluginType.plugin.name} corpus UI crashed`}>
+          <PluginCorpus network={network} context={pluginRegistry!.context} />
+        </PluginErrorBoundary>
+      </div>
+    )
   }
 
   return (

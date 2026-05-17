@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { networks, exporter, Activation, ExportFormat, Layer, Network, NetworkKind } from '../api'
 import type { TabProps } from '../App'
+import PluginErrorBoundary from '../components/PluginErrorBoundary'
 
 const ACTIVATIONS: Activation[] = ['identity', 'relu', 'sigmoid', 'tanh', 'softmax']
 
@@ -114,12 +115,19 @@ function buildLayers(form: FormState): { layers: Layer[]; inputDim: number; outp
   return { layers, inputDim, outputDim: vocab }
 }
 
-export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { onSelect: (id: string) => void }) {
+export default function NetworksTab({ refreshNetworks, onSelect, pluginRegistry }: TabProps & { onSelect: (id: string) => void }) {
   const [list, setList] = useState<Network[]>([])
   const [error, setError] = useState<string | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState<FormState>(defaultForm('feedforward'))
   const [busy, setBusy] = useState(false)
+  /** Encoded "<pluginId>::<typeId>" when the Type dropdown points at a plugin
+   * type, otherwise null and the built-in form is used. */
+  const [selectedPluginType, setSelectedPluginType] = useState<string | null>(null)
+  const pluginTypes = pluginRegistry?.networkTypes ?? []
+  const activePluginType = selectedPluginType
+    ? pluginTypes.find(p => `${p.plugin.id}::${p.type.id}` === selectedPluginType) ?? null
+    : null
 
   useEffect(() => { void load() }, [])
 
@@ -195,19 +203,48 @@ export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { 
               <div>
                 <label>Type</label>
                 <select
-                  value={form.kind}
+                  value={selectedPluginType ?? form.kind}
                   onChange={e => {
-                    const kind = e.target.value as NetworkKind
-                    setForm(defaultForm(kind))
+                    const v = e.target.value
+                    if (v.startsWith('plugin::')) {
+                      setSelectedPluginType(v.slice('plugin::'.length))
+                    } else {
+                      setSelectedPluginType(null)
+                      setForm(defaultForm(v as NetworkKind))
+                    }
                   }}
                 >
                   <option value="feedforward">Feed-forward (regression / classification)</option>
                   <option value="next_token">Next-token MLP (text on one-hot window)</option>
                   <option value="transformer">Transformer LM (llama-style — exports to GGUF for llama.cpp / LM Studio)</option>
+                  {pluginTypes.map(({ plugin, type }) => (
+                    <option key={`${plugin.id}::${type.id}`} value={`plugin::${plugin.id}::${type.id}`}>
+                      {type.label} (plugin: {plugin.name})
+                    </option>
+                  ))}
                 </select>
               </div>
             </div>
 
+            {activePluginType && (
+              <PluginErrorBoundary fallbackTitle={`${activePluginType.plugin.name} create form crashed`}>
+                <div>
+                  <p className="muted">{activePluginType.type.description}</p>
+                  <activePluginType.type.CreateForm
+                    context={pluginRegistry!.context}
+                    onCreated={async (id) => {
+                      setShowForm(false)
+                      setSelectedPluginType(null)
+                      await load()
+                      await refreshNetworks()
+                      onSelect(id)
+                    }}
+                  />
+                </div>
+              </PluginErrorBoundary>
+            )}
+
+            {!activePluginType && <>
             {form.kind === 'transformer' ? (
               <>
                 <div className="grid-3">
@@ -335,6 +372,7 @@ export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { 
               </button>
               <button className="secondary" onClick={() => setShowForm(false)}>Cancel</button>
             </div>
+            </>}
           </div>
         )}
       </div>
@@ -479,3 +517,6 @@ function ArchitecturePreview({ preview }: {
     </div>
   )
 }
+
+// PluginErrorBoundary used here is imported from the components folder.
+

@@ -2135,6 +2135,48 @@ async fn infer(
     }
 }
 
+#[derive(serde::Serialize)]
+pub struct InferActivationsResponse {
+    /// `layers[i]` is the i-th layer description (e.g. "Linear (2 -> 8)") or
+    /// "input" for the very first entry.
+    pub layer_names: Vec<String>,
+    /// Activation values per layer. `activations[i]` has length `dims[i]`.
+    pub activations: Vec<Vec<f32>>,
+    pub dims: Vec<usize>,
+}
+
+#[tauri::command]
+async fn infer_with_activations(
+    state: State<'_, AppState>,
+    network_id: String,
+    features: Vec<f32>,
+) -> Result<InferActivationsResponse, String> {
+    let net = state.networks.read().await.get(&network_id).cloned()
+        .ok_or_else(|| "Network not found".to_string())?;
+    if net.kind != kinds::FEEDFORWARD {
+        return Err("infer_with_activations is only supported for feedforward networks".into());
+    }
+    if features.len() != net.input_dim {
+        return Err(format!(
+            "features length {} doesn't match input_dim {}",
+            features.len(), net.input_dim
+        ));
+    }
+    let model_arc = get_or_load_model(&state, &net).await?;
+    let model = model_arc.read().await;
+    let x = Tensor::new(vec![1, net.input_dim], features);
+    let acts = model.predict_with_activations(&x);
+
+    let mut layer_names = Vec::with_capacity(acts.len());
+    layer_names.push("input".to_string());
+    for l in &model.layers {
+        layer_names.push(l.describe());
+    }
+    let dims: Vec<usize> = acts.iter().map(|t| t.cols()).collect();
+    let activations: Vec<Vec<f32>> = acts.into_iter().map(|t| t.data).collect();
+    Ok(InferActivationsResponse { layer_names, activations, dims })
+}
+
 #[tauri::command]
 async fn stop_inference(
     state: State<'_, AppState>,
@@ -2329,7 +2371,7 @@ pub fn run() {
             build_vocabulary, set_advanced_vocabulary, get_vocabulary, tokenize_preview,
             start_training, stop_training, abort_training, get_training_status,
             get_training_history, clear_training_history,
-            infer, stop_inference,
+            infer, infer_with_activations, stop_inference,
             export_network,
             list_servers, create_server, update_server, delete_server,
             start_server, stop_server, server_status,

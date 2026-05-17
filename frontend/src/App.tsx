@@ -7,10 +7,12 @@ import InferenceTab from './tabs/InferenceTab'
 import DocsTab from './tabs/DocsTab'
 import ServerTab from './tabs/ServerTab'
 import SettingsTab from './tabs/SettingsTab'
+import PluginsTab from './tabs/PluginsTab'
 import { networks, Network } from './api'
 import { applySettings, loadSettings } from './settings'
+import { usePluginRegistry, type PluginRegistry } from './plugins/registry'
 
-type Tab = 'networks' | 'corpus' | 'vocab' | 'training' | 'inference' | 'docs' | 'server' | 'settings'
+type Tab = 'networks' | 'corpus' | 'vocab' | 'training' | 'inference' | 'plugins' | 'docs' | 'server' | 'settings'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'networks',  label: 'Networks' },
@@ -18,6 +20,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'vocab',     label: 'Vocabulary' },
   { id: 'training',  label: 'Training' },
   { id: 'inference', label: 'Inference' },
+  { id: 'plugins',   label: 'Plugins' },
   { id: 'docs',      label: 'Documentation' },
   { id: 'server',    label: 'Server' },
   { id: 'settings',  label: 'Settings' },
@@ -26,6 +29,7 @@ const TABS: { id: Tab; label: string }[] = [
 export interface TabProps {
   network: Network | null
   refreshNetworks: () => Promise<void>
+  pluginRegistry?: PluginRegistry
 }
 
 export default function App() {
@@ -37,7 +41,6 @@ export default function App() {
     try {
       const items = await networks.list()
       setList(items)
-      // If our selection has gone away (e.g. user deleted), reset.
       setSelectedId(prev => {
         if (prev && items.some(n => n.id === prev)) return prev
         return items.length > 0 ? items[0].id : null
@@ -49,13 +52,12 @@ export default function App() {
   }, [])
 
   useEffect(() => { void refresh() }, [refresh])
-
-  // Apply user theme settings on boot so the primary color picked in
-  // Settings persists across restarts.
   useEffect(() => { applySettings(loadSettings()) }, [])
 
+  const pluginRegistry = usePluginRegistry(refresh, setSelectedId)
+
   const selected = list.find(n => n.id === selectedId) ?? null
-  const props: TabProps = { network: selected, refreshNetworks: refresh }
+  const props: TabProps = { network: selected, refreshNetworks: refresh, pluginRegistry }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
@@ -73,12 +75,17 @@ export default function App() {
             {list.length === 0 ? (
               <option value="">— no networks yet —</option>
             ) : (
-              list.map(n => (
-                <option key={n.id} value={n.id}>
-                  {n.name} · {n.kind === 'next_token' ? 'next-token' : 'feed-forward'}
-                  {n.trained ? ' · trained' : ''}
-                </option>
-              ))
+              list.map(n => {
+                const plugin = pluginRegistry.typeForNetwork(n.id)
+                const typeLabel = plugin
+                  ? plugin.type.label
+                  : n.kind === 'next_token' ? 'next-token' : n.kind === 'transformer' ? 'transformer' : 'feed-forward'
+                return (
+                  <option key={n.id} value={n.id}>
+                    {n.name} · {typeLabel}{n.trained ? ' · trained' : ''}
+                  </option>
+                )
+              })
             )}
           </select>
         </div>
@@ -103,9 +110,10 @@ export default function App() {
           {activeTab === 'vocab'     && <VocabTab     {...props} />}
           {activeTab === 'training'  && <TrainingTab  {...props} />}
           {activeTab === 'inference' && <InferenceTab {...props} />}
+          {activeTab === 'plugins'   && <PluginsTab   registry={pluginRegistry} />}
           {activeTab === 'docs'      && <DocsTab      networks={list} />}
           {activeTab === 'server'    && <ServerTab    networks={list} />}
-          {activeTab === 'settings'  && <SettingsTab  onChange={() => { /* re-render via state in tab */ }} />}
+          {activeTab === 'settings'  && <SettingsTab  onChange={() => {}} />}
         </main>
       </div>
     </div>

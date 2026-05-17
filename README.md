@@ -62,10 +62,16 @@ neuralcabin/
 │
 ├── frontend/               — React + TypeScript UI
 │   ├── src/
-│   │   ├── App.tsx         — Main 7-tab application
+│   │   ├── App.tsx         — Main multi-tab application + plugin host
 │   │   ├── api.ts          — Tauri invoke/listen wrappers
 │   │   ├── index.css       — Styling (Times New Roman, orange theme)
-│   │   └── tabs/           — Tab components
+│   │   ├── tabs/           — Tab components (incl. PluginsTab)
+│   │   ├── components/     — Shared UI (NetworkViz, PluginErrorBoundary)
+│   │   └── plugins/        — Plugin system
+│   │       ├── types.ts       — Plugin API (NetworkType, PluginContext)
+│   │       ├── registry.ts    — Install/enable/load + per-network tagging
+│   │       ├── storage.ts     — IndexedDB k/v for large plugin payloads
+│   │       └── builtins/      — Out-of-the-box plugins (Image Classification)
 │   ├── package.json
 │   ├── vite.config.ts
 │   └── index.html
@@ -98,9 +104,28 @@ No HTTP server, no WebSocket, no localhost URL. The React frontend talks directl
 - **Cross-platform** — Windows, macOS, Linux installers from CI
 
 ### 🎨 React + TypeScript UI
-- **7 Tabs:** Docs, Networks, Corpus, Vocab, Training, Inference, Plugins
+- **Tabs:** Networks, Corpus, Vocabulary, Training, Inference, Plugins, Documentation, Server, Settings
 - **Orange Theme:** Warm design with Times New Roman typography
 - **Real-time Training:** Live loss curve updated every epoch via Tauri events
+- **Network Visualization:** the Inference tab renders feed-forward networks
+  as colored neurons per layer with activations from the most recent forward
+  pass — works for built-in feed-forward networks and any plugin-contributed
+  type that uses the same engine path.
+
+### 🔌 Plugin System
+- **New network types contributed by plugins** appear in the same Type
+  dropdown as the built-in ones. A plugin owns its create form, corpus UI,
+  and inference UI for the types it adds.
+- **Plugin runtime:** plain JS/TS modules loaded into the host realm (no
+  sandbox — installing a plugin is a trust decision).
+- **Built-in:** an **Image Classification** plugin ships enabled. Configure
+  image size, RGB vs. grayscale, hidden layers, output activation, and seed;
+  build a corpus by uploading images or drawing them on the canvas; predict
+  by drawing/uploading at inference time (with an opt-in real-time mode).
+  Samples are persisted in IndexedDB so the localStorage quota isn't an
+  issue.
+- **Marketplace:** a Cloudflare-backed registry of signed plugins is a
+  planned follow-up; the Plugins tab already shows the stub.
 
 ### 🧠 Pure Rust ML Engine
 - **Zero external math dependencies** — tensors, matmul, autograd, optimizers hand-written
