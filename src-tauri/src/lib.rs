@@ -355,20 +355,6 @@ async fn rebuild_transformer_model(
     Ok(())
 }
 
-/// Snapshot of a set of frozen transformer parameters, taken before an
-/// optimizer step and re-installed after it. Each entry is `(key, tensor)`
-/// where the key matches the scheme described on `TrainingConfig::frozen_layers`.
-struct FrozenSnapshot {
-    /// Whether to preserve the (vocab, n_embd) token embedding.
-    embedding: Option<Tensor>,
-    /// Final RMSNorm scale.
-    output_norm: Option<Tensor>,
-    /// (n_embd, vocab) LM head.
-    output: Option<Tensor>,
-    /// All 9 weight tensors of each frozen block, indexed by block id.
-    blocks: HashMap<usize, neuralcabin_engine::transformer::BlockWeights>,
-}
-
 fn parse_frozen_keys(keys: &[String]) -> (bool, bool, bool, Vec<usize>) {
     let mut emb = false; let mut out_norm = false; let mut out = false;
     let mut blocks: Vec<usize> = Vec::new();
@@ -432,29 +418,6 @@ fn restore_linear_layers(model: &mut Model, snaps: &[(usize, Tensor, Tensor)]) {
             l.w = w.clone();
             l.b = b.clone();
         }
-    }
-}
-
-fn snapshot_frozen_layers(model: &TransformerModel, keys: &[String]) -> FrozenSnapshot {
-    let (emb, out_norm, out, block_ids) = parse_frozen_keys(keys);
-    let mut blocks = HashMap::new();
-    for &i in &block_ids {
-        if let Some(b) = model.blocks.get(i) { blocks.insert(i, b.clone()); }
-    }
-    FrozenSnapshot {
-        embedding:   if emb { Some(model.token_embd.clone()) } else { None },
-        output_norm: if out_norm { Some(model.output_norm.clone()) } else { None },
-        output:      if out { Some(model.output.clone()) } else { None },
-        blocks,
-    }
-}
-
-fn restore_frozen_layers(model: &mut TransformerModel, snap: &FrozenSnapshot) {
-    if let Some(t) = &snap.embedding   { model.token_embd  = t.clone(); }
-    if let Some(t) = &snap.output_norm { model.output_norm = t.clone(); }
-    if let Some(t) = &snap.output      { model.output      = t.clone(); }
-    for (&i, b) in &snap.blocks {
-        if let Some(dst) = model.blocks.get_mut(i) { *dst = b.clone(); }
     }
 }
 
@@ -1384,10 +1347,38 @@ async fn run_transformer_training_loop(
     let mut rng = SplitMix64::new(cfg.seed.wrapping_add(0x5A5A_A5A5_A5A5_5A5A));
     let mut indices: Vec<usize> = (0..sequences.len()).collect();
     let device = neuralcabin_engine::default_gpu_device();
-    let mut step_counter: u64 = 0;
+
+    // Build the trainer session ONCE per run. The previous implementation
+    // re-uploaded every model weight to the GPU, rebuilt the optimizer (so
+    // Adam's momentum/variance state was zero every step → effectively SGD
+    // with very small effective LR), and reallocated the RoPE/causal-mask
+    // tensors on every batch. That overhead, combined with the lost optimizer
+    // state, is why training that should take seconds was taking hours.
+    //
+    // The session keeps the model and optimizer resident on the GPU for the
+    // whole run and reuses the precomputed RoPE tables and causal mask.
+    let mut session = neuralcabin_engine::TrainerSession::<
+        neuralcabin_engine::GpuAutodiffBackend,
+    >::new(
+        &*model_arc.read().await,
+        &opt_kind,
+        n_ctx,
+        device.clone(),
+    );
+
+    // Parse frozen-layer keys once. The session does on-device snapshot/
+    // restore around each step using these.
+    let (frz_emb, frz_out_norm, frz_out, frz_blocks) = parse_frozen_keys(&frozen_layers);
+    let has_frozen = frz_emb || frz_out_norm || frz_out || !frz_blocks.is_empty();
 
     for epoch in 1..=cfg.epochs {
         if cancel.load(Ordering::Relaxed) {
+            // Sync the latest GPU weights back to the CPU model unless we'll
+            // roll back to the snapshot anyway.
+            if !rollback.load(Ordering::Relaxed) {
+                let mut m = model_arc.write().await;
+                session.write_back(&mut m);
+            }
             transformer_finish_cancelled(
                 &app, &training_id, &network_id, &cfg, started_at,
                 epoch.saturating_sub(1), &loss_history, start,
@@ -1414,24 +1405,15 @@ async fn run_transformer_training_loop(
                 input_flat.extend_from_slice(&sequences[i].0);
                 target_flat.extend_from_slice(&sequences[i].1);
             }
-            let loss = {
-                let mut model = model_arc.write().await;
-                step_counter += 1;
-                // Snapshot frozen layers before the step. After the optimizer
-                // updates every parameter, we restore these — net effect:
-                // gradient still flows for the loss signal but weights for
-                // frozen layers don't move. Simpler and more robust than
-                // tampering with Burn's GradientsParams internals.
-                let frozen_snapshot = snapshot_frozen_layers(&model, &frozen_layers);
-                let l = neuralcabin_engine::transformer::train_step_on_device::<
-                    neuralcabin_engine::GpuAutodiffBackend,
-                >(
-                    &mut model, &opt_kind, step_counter,
-                    &input_flat, &target_flat, b, n_ctx, &device,
-                );
-                restore_frozen_layers(&mut model, &frozen_snapshot);
-                l
+            let frozen_snap = if has_frozen {
+                Some(session.snapshot_frozen(frz_emb, frz_out_norm, frz_out, &frz_blocks))
+            } else {
+                None
             };
+            let loss = session.step(&input_flat, &target_flat, b);
+            if let Some(snap) = &frozen_snap {
+                session.restore_frozen(snap);
+            }
             if !loss.is_finite() {
                 let elapsed = start.elapsed().as_secs_f32();
                 let run = build_training_run_record(
@@ -1449,6 +1431,13 @@ async fn run_transformer_training_loop(
         }
         let mean_loss = epoch_loss / batches.max(1) as f32;
         loss_history.push(mean_loss);
+
+        // Sync GPU weights to the CPU model once per epoch so the rest of
+        // the app (inference, autosave, UI snapshots) sees the latest.
+        {
+            let mut m = model_arc.write().await;
+            session.write_back(&mut m);
+        }
 
         let elapsed = start.elapsed().as_secs_f32();
         {
