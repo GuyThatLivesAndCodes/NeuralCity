@@ -9,7 +9,28 @@ export default function InferenceTab({ network, pluginRegistry }: TabProps) {
   const [error, setError] = useState<string | null>(null)
   const [corpusStats, setCorpusStats] = useState<CorpusStats | null>(null)
 
-  // Plugin-managed networks own their own inference UI.
+  // IMPORTANT: every hook in this component must run on every render. The
+  // conditional early-return for plugin-managed networks lives *after* the
+  // hooks; otherwise switching between a plugin-managed and a built-in
+  // network changes the hook call count and React tears the tree down.
+  useEffect(() => {
+    if (!network) {
+      setCorpusStats(null)
+      return
+    }
+    const fetch = async () => {
+      try {
+        const stats = await corpus.stats(network.id)
+        setCorpusStats(stats)
+      } catch (e) {
+        setCorpusStats(null)
+      }
+    }
+    void fetch()
+  }, [network?.id])
+
+  // Plugin-managed networks own their own inference UI. Must come AFTER all
+  // hooks above so hook ordering stays stable across network-type switches.
   const pluginType = network && pluginRegistry?.typeForNetwork(network.id)
   if (network && pluginType?.type.InferenceUI) {
     const PluginInference = pluginType.type.InferenceUI
@@ -27,22 +48,6 @@ export default function InferenceTab({ network, pluginRegistry }: TabProps) {
       </div>
     )
   }
-
-  useEffect(() => {
-    if (!network) {
-      setCorpusStats(null)
-      return
-    }
-    const fetch = async () => {
-      try {
-        const stats = await corpus.stats(network.id)
-        setCorpusStats(stats)
-      } catch (e) {
-        setCorpusStats(null)
-      }
-    }
-    void fetch()
-  }, [network?.id])
 
   const isFinetuned = network?.kind === 'next_token' && corpusStats?.stage === 'finetune'
 

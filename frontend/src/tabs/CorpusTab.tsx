@@ -11,6 +11,16 @@ export default function CorpusTab({ network, pluginRegistry }: TabProps) {
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(null)
 
+  // Declared before the useEffect so the effect's closure isn't stuck in the
+  // const's temporal dead zone when this component takes its plugin-managed
+  // early-return path (the effect still runs after commit either way; if it
+  // referenced `loadStats` while that declaration had been skipped, accessing
+  // it from the effect would throw ReferenceError and blank the entire app).
+  const loadStats = async (id: string) => {
+    try { setStats(await corpus.stats(id)) }
+    catch (e) { setStats(null); setError(String(e)) }
+  }
+
   useEffect(() => {
     if (network) void loadStats(network.id)
     else setStats(null)
@@ -33,11 +43,6 @@ export default function CorpusTab({ network, pluginRegistry }: TabProps) {
         </PluginErrorBoundary>
       </div>
     )
-  }
-
-  const loadStats = async (id: string) => {
-    try { setStats(await corpus.stats(id)) }
-    catch (e) { setStats(null); setError(String(e)) }
   }
 
   return (
