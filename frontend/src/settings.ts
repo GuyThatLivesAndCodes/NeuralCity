@@ -10,6 +10,8 @@ export interface AppSettings {
   primaryColor: string
   /** Hover-state colour, derived from `primaryColor` by default. */
   primaryHover: string
+  /** App background base colour. Elevated surfaces are derived from this. */
+  backgroundColor: string
   /**
    * Preferred compute backend for training.
    *
@@ -29,6 +31,7 @@ const STORAGE_KEY = 'neuralcabin.settings.v1'
 const DEFAULTS: AppSettings = {
   primaryColor: '#d97757',
   primaryHover: '#c8633e',
+  backgroundColor: '#1a1815',
   computeBackend: 'gpu',
   showDeviceInfo: true,
 }
@@ -67,6 +70,24 @@ export function applySettings(s: AppSettings): void {
   const { r, g, b } = parseHex(s.primaryColor)
   root.style.setProperty('--accent-soft', `rgba(${r}, ${g}, ${b}, 0.12)`)
   root.style.setProperty('--accent-bg', `rgba(${r}, ${g}, ${b}, 0.08)`)
+
+  // Background palette — base + two elevated shades + a recessed input shade.
+  // We shift brightness in linear steps so any user-picked base produces a
+  // coherent set of surfaces, the same way the default warm-dark palette did.
+  const base = parseHex(s.backgroundColor)
+  root.style.setProperty('--bg',        rgbStr(base))
+  root.style.setProperty('--bg-elev-1', rgbStr(shiftBrightness(base,  8)))
+  root.style.setProperty('--bg-elev-2', rgbStr(shiftBrightness(base, 16)))
+  root.style.setProperty('--bg-input',  rgbStr(shiftBrightness(base, -4)))
+}
+
+function rgbStr({ r, g, b }: { r: number; g: number; b: number }): string {
+  return `rgb(${r}, ${g}, ${b})`
+}
+
+function shiftBrightness(c: { r: number; g: number; b: number }, delta: number) {
+  const clamp = (v: number) => Math.max(0, Math.min(255, v))
+  return { r: clamp(c.r + delta), g: clamp(c.g + delta), b: clamp(c.b + delta) }
 }
 
 /** Parse a #rrggbb / #rgb string into rgb components. Falls back to the

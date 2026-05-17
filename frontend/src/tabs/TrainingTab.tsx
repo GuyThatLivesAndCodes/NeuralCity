@@ -205,20 +205,51 @@ export default function TrainingTab({ network, refreshNetworks }: TabProps) {
               </div>
             )}
           </div>
-          {isTransformer && isFinetune && network?.pretrained && (
+          {network && (
             <div style={{ marginTop: 16, padding: 12, border: '1px solid var(--border-soft)',
                           borderRadius: 'var(--radius)', background: 'var(--bg-input)' }}>
               <h4 style={{ margin: 0 }}>Layer locking</h4>
               <p className="muted small" style={{ marginTop: 6 }}>
-                Freeze parts of the pre-trained network so fine-tuning can't drift them. GPT-style fine-tuning typically freezes the token embedding and early blocks, leaving only the later blocks and LM head trainable.
+                {isTransformer
+                  ? 'Freeze parts of the network so training can\'t drift them. GPT-style fine-tuning typically freezes the token embedding and early blocks, leaving only the later blocks and LM head trainable.'
+                  : 'Freeze individual linear layers so their weights stay put while the rest of the network keeps learning.'}
               </p>
               <div className="flex" style={{ flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
-                <FreezeChip label="Token embedding" k="embedding" frozen={frozenLayers} onToggle={toggleFrozen} />
-                {Array.from({ length: network.transformer?.n_layers ?? 0 }, (_, i) => (
-                  <FreezeChip key={i} label={`Block ${i}`} k={`block:${i}`} frozen={frozenLayers} onToggle={toggleFrozen} />
-                ))}
-                <FreezeChip label="Final norm" k="output_norm" frozen={frozenLayers} onToggle={toggleFrozen} />
-                <FreezeChip label="LM head" k="output" frozen={frozenLayers} onToggle={toggleFrozen} />
+                {isTransformer ? (
+                  <>
+                    <FreezeChip label="Token embedding" k="embedding" frozen={frozenLayers} onToggle={toggleFrozen} />
+                    {Array.from({ length: network.transformer?.n_layers ?? 0 }, (_, i) => (
+                      <FreezeChip key={i} label={`Block ${i}`} k={`block:${i}`} frozen={frozenLayers} onToggle={toggleFrozen} />
+                    ))}
+                    <FreezeChip label="Final norm" k="output_norm" frozen={frozenLayers} onToggle={toggleFrozen} />
+                    <FreezeChip label="LM head" k="output" frozen={frozenLayers} onToggle={toggleFrozen} />
+                  </>
+                ) : (
+                  (() => {
+                    const linears = network.layers
+                      .map((l, i) => ({ l, i }))
+                      .filter(x => x.l.type === 'linear')
+                    if (linears.length === 0) {
+                      return <p className="muted small" style={{ margin: 0 }}>
+                        No layers yet. {network.kind === 'next_token'
+                          ? 'Build a vocabulary on the Corpus tab to materialise the model.'
+                          : 'Add layers when creating the network.'}
+                      </p>
+                    }
+                    return linears.map(({ l, i }, n) => {
+                      const linear = l as { type: 'linear'; in_dim: number; out_dim: number }
+                      return (
+                        <FreezeChip
+                          key={i}
+                          label={`Linear ${n} (${linear.in_dim}→${linear.out_dim})`}
+                          k={`linear:${n}`}
+                          frozen={frozenLayers}
+                          onToggle={toggleFrozen}
+                        />
+                      )
+                    })
+                  })()
+                )}
               </div>
               <p className="muted small" style={{ marginTop: 8 }}>
                 {frozenLayers.size === 0

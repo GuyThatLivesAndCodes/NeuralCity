@@ -389,6 +389,52 @@ fn parse_frozen_keys(keys: &[String]) -> (bool, bool, bool, Vec<usize>) {
     (emb, out_norm, out, blocks)
 }
 
+/// Parse `linear:N` keys (and case-equivalents) into the indices of the
+/// linear sub-layers to freeze, counted by occurrence among `model.layers`.
+/// Unknown keys are ignored — e.g. a transformer-only key on a feedforward
+/// network is a no-op rather than a hard error.
+fn parse_linear_frozen_keys(keys: &[String]) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for k in keys {
+        let k = k.trim();
+        let rest = k.strip_prefix("linear:")
+            .or_else(|| k.strip_prefix("linear_"))
+            .or_else(|| k.strip_prefix("layer:"));
+        if let Some(rest) = rest {
+            if let Ok(idx) = rest.parse::<usize>() { out.push(idx); }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Snapshot a chosen subset of `Layer::Linear` weight+bias pairs. The slot
+/// number is the position among linear layers (not all layers), so
+/// `linear:0` is the first linear layer regardless of preceding activations.
+fn snapshot_linear_layers(model: &Model, linear_indices: &[usize]) -> Vec<(usize, Tensor, Tensor)> {
+    let mut snaps = Vec::new();
+    let mut lin_n = 0_usize;
+    for (i, layer) in model.layers.iter().enumerate() {
+        if let Layer::Linear(l) = layer {
+            if linear_indices.contains(&lin_n) {
+                snaps.push((i, l.w.clone(), l.b.clone()));
+            }
+            lin_n += 1;
+        }
+    }
+    snaps
+}
+
+fn restore_linear_layers(model: &mut Model, snaps: &[(usize, Tensor, Tensor)]) {
+    for (i, w, b) in snaps {
+        if let Some(Layer::Linear(l)) = model.layers.get_mut(*i) {
+            l.w = w.clone();
+            l.b = b.clone();
+        }
+    }
+}
+
 fn snapshot_frozen_layers(model: &TransformerModel, keys: &[String]) -> FrozenSnapshot {
     let (emb, out_norm, out, block_ids) = parse_frozen_keys(keys);
     let mut blocks = HashMap::new();
@@ -1603,12 +1649,13 @@ async fn start_training(
     let cfg = req.config.clone();
     let net_id = req.network_id.clone();
     let stage_for_loop = corpus.stage.clone().unwrap_or_else(|| "pretrain".into());
+    let frozen = cfg.frozen_layers.clone().unwrap_or_default();
 
     tokio::spawn(async move {
         run_training_loop(
             app, id_clone, net_id, cfg, started_at, model_arc, networks_handle,
             x, y, loss_kind, batch_size, training_state, cancel, rollback,
-            stage_for_loop,
+            stage_for_loop, frozen,
         ).await;
         // The TrainerHandle stays in `state.trainers` so callers can still
         // query its final status. Map cleanup happens at app shutdown.
@@ -1686,6 +1733,7 @@ async fn run_training_loop(
     cancel: Arc<AtomicBool>,
     rollback: Arc<AtomicBool>,
     stage: String,
+    frozen_layers: Vec<String>,
 ) {
     let n = x.rows();
     let in_dim = x.cols();
@@ -1817,9 +1865,17 @@ async fn run_training_loop(
             let loss = {
                 let mut model = model_arc.write().await;
                 step_counter += 1;
-                neuralcabin_engine::train_step_on_device::<neuralcabin_engine::GpuAutodiffBackend>(
+                // Snapshot frozen linear layers, run the optimiser step,
+                // then restore — net effect is gradient flows through them
+                // but weights don't move. Matches how the transformer path
+                // handles its own frozen components.
+                let frozen_indices = parse_linear_frozen_keys(&frozen_layers);
+                let snaps = snapshot_linear_layers(&model, &frozen_indices);
+                let l = neuralcabin_engine::train_step_on_device::<neuralcabin_engine::GpuAutodiffBackend>(
                     &mut model, &optimizer, step_counter, loss_kind, &bx, &by, &device,
-                )
+                );
+                restore_linear_layers(&mut model, &snaps);
+                l
             };
             if !loss.is_finite() {
                 let elapsed = start.elapsed().as_secs_f32();

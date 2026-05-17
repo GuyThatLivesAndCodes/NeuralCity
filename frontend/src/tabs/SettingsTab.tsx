@@ -9,6 +9,15 @@ interface Props {
   onChange: (s: AppSettings) => void
 }
 
+const BG_PRESETS: { name: string; hex: string }[] = [
+  { name: 'Cabin dark',    hex: '#1a1815' },
+  { name: 'Midnight',      hex: '#0f1216' },
+  { name: 'Slate',         hex: '#1b1f24' },
+  { name: 'Forest',        hex: '#141a16' },
+  { name: 'Charcoal',      hex: '#1d1d1d' },
+  { name: 'Cocoa',         hex: '#1f1814' },
+]
+
 const PRESETS: { name: string; hex: string }[] = [
   { name: 'Cabin orange',  hex: '#d97757' },
   { name: 'Cobalt',        hex: '#3b82f6' },
@@ -127,6 +136,59 @@ export default function SettingsTab({ onChange }: Props) {
             <button className="secondary">Secondary</button>
             <span className="chip">Chip</span>
             <span className="status success" style={{ display: 'inline-block' }}>Success</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <h3>Background color</h3>
+        <p className="muted" style={{ marginTop: 4 }}>
+          The base canvas colour. Elevated cards, inputs, and the nav are
+          auto-derived from this single value so the whole palette shifts
+          together.
+        </p>
+
+        <div className="flex" style={{ flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
+          {BG_PRESETS.map(p => (
+            <button
+              key={p.hex}
+              onClick={() => update({ backgroundColor: p.hex })}
+              className={settings.backgroundColor.toLowerCase() === p.hex.toLowerCase()
+                ? '' : 'secondary'}
+              title={p.hex}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                textTransform: 'none', letterSpacing: 0,
+              }}
+            >
+              <span style={{
+                width: 14, height: 14, borderRadius: 4,
+                background: p.hex, border: '1px solid var(--border)',
+                display: 'inline-block',
+              }} />
+              {p.name}
+            </button>
+          ))}
+        </div>
+
+        <div className="grid-2 mt-2">
+          <div>
+            <label>Hex value</label>
+            <div className="flex" style={{ alignItems: 'center', gap: 8 }}>
+              <input
+                value={settings.backgroundColor}
+                onChange={e => update({ backgroundColor: e.target.value })}
+                placeholder="#1a1815"
+                style={{ fontFamily: 'var(--font-mono)' }}
+              />
+              <input
+                type="color"
+                value={normalizeForColorInput(settings.backgroundColor)}
+                onChange={e => update({ backgroundColor: e.target.value })}
+                style={{ width: 44, height: 38, padding: 0, cursor: 'pointer' }}
+                aria-label="Pick a background color"
+              />
+            </div>
           </div>
         </div>
       </div>
