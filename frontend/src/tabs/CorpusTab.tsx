@@ -5,7 +5,7 @@ import {
 } from '../api'
 import type { TabProps } from '../App'
 
-export default function CorpusTab({ network }: TabProps) {
+export default function CorpusTab({ network, pluginRegistry }: TabProps) {
   const [stats, setStats] = useState<CorpusStats | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(null)
@@ -14,6 +14,21 @@ export default function CorpusTab({ network }: TabProps) {
     if (network) void loadStats(network.id)
     else setStats(null)
   }, [network])
+
+  // Plugin-managed networks own their own corpus UI.
+  const pluginType = network && pluginRegistry?.typeForNetwork(network.id)
+  if (network && pluginType?.type.CorpusUI) {
+    const PluginCorpus = pluginType.type.CorpusUI
+    return (
+      <div className="tab-content">
+        <h2>Corpus</h2>
+        <p className="muted">
+          Managed by plugin <strong>{pluginType.plugin.name}</strong> · type <strong>{pluginType.type.label}</strong>.
+        </p>
+        <PluginCorpus network={network} context={pluginRegistry!.context} />
+      </div>
+    )
+  }
 
   const loadStats = async (id: string) => {
     try { setStats(await corpus.stats(id)) }

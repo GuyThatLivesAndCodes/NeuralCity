@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { networks, exporter, Activation, ExportFormat, Layer, Network, NetworkKind } from '../api'
 import type { TabProps } from '../App'
+import type { NetworkTypeDescriptor, PluginContext } from '../plugins/types'
 
 const ACTIVATIONS: Activation[] = ['identity', 'relu', 'sigmoid', 'tanh', 'softmax']
 
@@ -114,7 +115,7 @@ function buildLayers(form: FormState): { layers: Layer[]; inputDim: number; outp
   return { layers, inputDim, outputDim: vocab }
 }
 
-export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { onSelect: (id: string) => void }) {
+export default function NetworksTab({ refreshNetworks, onSelect, pluginRegistry }: TabProps & { onSelect: (id: string) => void }) {
   const [list, setList] = useState<Network[]>([])
   const [error, setError] = useState<string | null>(null)
   const [showForm, setShowForm] = useState(false)
@@ -176,6 +177,28 @@ export default function NetworksTab({ refreshNetworks, onSelect }: TabProps & { 
       <p className="muted">Create and manage neural-network architectures.</p>
 
       {error && <div className="status error">{error}</div>}
+
+      {pluginRegistry && pluginRegistry.networkTypes.length > 0 && (
+        <div className="card">
+          <h3>Plugin network types</h3>
+          <p className="muted">
+            Types contributed by installed plugins. Each plugin manages its own
+            create form, corpus, and inference UI.
+          </p>
+          {pluginRegistry.networkTypes.map(({ plugin, type }) => (
+            <PluginTypeCard
+              key={`${plugin.id}:${type.id}`}
+              pluginName={plugin.name}
+              type={type}
+              context={pluginRegistry.context}
+              onCreated={async (id) => {
+                await refreshNetworks()
+                onSelect(id)
+              }}
+            />
+          ))}
+        </div>
+      )}
 
       <div className="card">
         <div className="card-row">
@@ -479,3 +502,37 @@ function ArchitecturePreview({ preview }: {
     </div>
   )
 }
+
+// ─── Plugin type card (Networks tab) ─────────────────────────────────────────
+
+function PluginTypeCard({
+  pluginName, type, context, onCreated,
+}: {
+  pluginName: string
+  type: NetworkTypeDescriptor
+  context: PluginContext
+  onCreated: (id: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const Form = type.CreateForm
+  return (
+    <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, marginTop: 12 }}>
+      <div className="card-row">
+        <div>
+          <strong>{type.label}</strong>{" "}
+          <span className="muted" style={{ fontSize: 12 }}>· {pluginName}</span>
+          <div className="muted" style={{ fontSize: 13 }}>{type.description}</div>
+        </div>
+        <button onClick={() => setOpen(o => !o)} className={open ? "secondary" : ""}>
+          {open ? "Cancel" : "New"}
+        </button>
+      </div>
+      {open && (
+        <div className="mt-2">
+          <Form context={context} onCreated={(id) => { setOpen(false); onCreated(id) }} />
+        </div>
+      )}
+    </div>
+  )
+}
+
