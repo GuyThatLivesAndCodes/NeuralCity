@@ -18,7 +18,20 @@ serde_json = "1"
 # - `autodiff` : automatic differentiation (replaces our hand-written tape)
 # - `ndarray`  : CPU backend (required so `cargo test` runs without a GPU)
 # - `std`      : standard library bridge
-burn = { version = "0.16", default-features = false, features = ["wgpu", "autodiff", "ndarray", "std"] }
+# - `fusion`   : CubeCL kernel-fusion pass. Folds the dozens of tiny ops in a
+#                transformer block (rmsnorm mul/add/sqrt, attention scale/mask,
+#                SwiGLU multiply, residual add) into a handful of fused GPU
+#                kernels. The single biggest GPU-side speedup for transformer
+#                training — without it, each elementwise op is one dispatch
+#                plus one read/write of working memory, and pre-norm transformer
+#                blocks fire off ~20 such ops per layer.
+# - `autotune` : Pick the best matmul kernel variant for the current GPU and
+#                input shape at runtime. The wgpu backend ships several matmul
+#                strategies (loop-tile, tensor-core, vectorized); the right
+#                choice depends on (M, K, N) and the GPU. Without autotune the
+#                fallback kernel is often 2–4× slower than the best variant
+#                for the shapes a small transformer hits.
+burn = { version = "0.16", default-features = false, features = ["wgpu", "autodiff", "ndarray", "std", "fusion", "autotune"] }
 
 [dev-dependencies]
 # Burn 0.16's autodiff backend has thread-local node state that breaks when

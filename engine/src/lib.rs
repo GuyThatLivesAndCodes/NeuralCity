@@ -29,4 +29,4 @@ pub use nn::{train_step_on_device, Layer, LayerSpec, Model};
 pub use optimizer::{Optimizer, OptimizerKind};
 pub use tensor::Tensor;
 pub use tokenizer::{TokenizerMode, Vocabulary};
-pub use transformer::{FrozenSnapshotGpu, TrainerSession};
+pub use transformer::{FrozenSnapshotGpu, InferenceSession, TrainerSession};

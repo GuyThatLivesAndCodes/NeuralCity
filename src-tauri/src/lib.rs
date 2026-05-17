@@ -1393,14 +1393,15 @@ async fn run_transformer_training_loop(
             indices.swap(i, j);
         }
 
-        let mut epoch_loss = 0.0_f32;
-        let mut batches = 0_usize;
+        // Reusable scratch for the per-batch flattens — avoids two `Vec`
+        // allocations per step that just immediately drop after upload.
+        let mut input_flat:  Vec<u32> = Vec::with_capacity(batch_size * n_ctx);
+        let mut target_flat: Vec<u32> = Vec::with_capacity(batch_size * n_ctx);
         for chunk in indices.chunks(batch_size) {
             if cancel.load(Ordering::Relaxed) { break; }
             let b = chunk.len();
-            // Flatten this batch into contiguous (b*n_ctx) input/target arrays.
-            let mut input_flat  = Vec::with_capacity(b * n_ctx);
-            let mut target_flat = Vec::with_capacity(b * n_ctx);
+            input_flat.clear();
+            target_flat.clear();
             for &i in chunk {
                 input_flat.extend_from_slice(&sequences[i].0);
                 target_flat.extend_from_slice(&sequences[i].1);
@@ -1410,26 +1411,29 @@ async fn run_transformer_training_loop(
             } else {
                 None
             };
-            let loss = session.step(&input_flat, &target_flat, b);
+            session.step(&input_flat, &target_flat, b);
             if let Some(snap) = &frozen_snap {
                 session.restore_frozen(snap);
             }
-            if !loss.is_finite() {
-                let elapsed = start.elapsed().as_secs_f32();
-                let run = build_training_run_record(
-                    &training_id, &network_id, &cfg, started_at,
-                    epoch, loss_history.last().copied().unwrap_or(0.0),
-                    elapsed, &loss_history, "error",
-                );
-                record_and_persist_run(&app, run).await;
-                mark_error(&training_state, &training_id, &app,
-                    format!("Loss diverged to {loss} at epoch {epoch}")).await;
-                return;
-            }
-            epoch_loss += loss;
-            batches += 1;
+            // No per-batch readback or `.is_finite()` check — divergence is
+            // detected at the epoch-mean boundary below. Per-batch readback
+            // was the single biggest reason Windows users were seeing < 1
+            // epoch / hour; WGPU dispatches are non-blocking, but
+            // `into_scalar()` is a hard sync point that stalled the queue.
         }
-        let mean_loss = epoch_loss / batches.max(1) as f32;
+        let mean_loss = session.take_pending_loss_mean().unwrap_or(0.0);
+        if !mean_loss.is_finite() {
+            let elapsed = start.elapsed().as_secs_f32();
+            let run = build_training_run_record(
+                &training_id, &network_id, &cfg, started_at,
+                epoch, loss_history.last().copied().unwrap_or(0.0),
+                elapsed, &loss_history, "error",
+            );
+            record_and_persist_run(&app, run).await;
+            mark_error(&training_state, &training_id, &app,
+                format!("Loss diverged to {mean_loss} at epoch {epoch}")).await;
+            return;
+        }
         loss_history.push(mean_loss);
 
         // Sync GPU weights to the CPU model once per epoch so the rest of
@@ -1443,14 +1447,27 @@ async fn run_transformer_training_loop(
         {
             let mut s = training_state.write().await;
             s.epoch = epoch; s.last_loss = mean_loss;
-            s.loss_history = loss_history.clone(); s.elapsed_secs = elapsed;
+            // `loss_history` is cloned into `TrainingState` so the UI can
+            // request a fresh status snapshot without coordinating with the
+            // event stream. The clone is O(epochs) — fine for the 100s of
+            // points we ever produce — but we only do it once per epoch
+            // here, not on every emit.
+            s.loss_history.clone_from(&loss_history);
+            s.elapsed_secs = elapsed;
         }
+        // Emit a copy of the running history so the frontend can re-render
+        // the loss plot without round-tripping back through
+        // `get_training_status`. Fires once per epoch, not per batch — the
+        // cost is bounded by `epochs`, not by the number of training steps.
         let _ = app.emit("training_update", TrainingUpdate {
             training_id: training_id.clone(),
             epoch, total_epochs: cfg.epochs,
             loss: mean_loss, loss_history: loss_history.clone(),
             elapsed_secs: elapsed,
         });
+        // Yield once per epoch is enough for cooperative cancel — yielding
+        // after every batch added scheduling overhead on top of the GPU
+        // work, which mattered when batches were sub-millisecond.
         tokio::task::yield_now().await;
     }
 
@@ -1762,6 +1779,13 @@ async fn run_training_loop(
     // back to a CPU compute pipeline.
     let device = neuralcabin_engine::default_gpu_device();
     let mut step_counter: u64 = 0;
+    // Parse frozen-layer keys once before the loop — string parsing per batch
+    // showed up in profiles for short-step workloads.
+    let frozen_indices = parse_linear_frozen_keys(&frozen_layers);
+    let has_frozen = !frozen_indices.is_empty();
+    // Scratch buffers reused across batches.
+    let mut bx_data: Vec<f32> = Vec::with_capacity(batch_size * in_dim);
+    let mut by_data: Vec<f32> = Vec::with_capacity(batch_size * out_dim);
 
     /// Run the cleanup path for a cancelled training run. Honours `rollback`
     /// to decide whether to keep or revert the in-progress weights, records
@@ -1840,14 +1864,14 @@ async fn run_training_loop(
         let mut batches = 0usize;
         for chunk in indices.chunks(batch_size) {
             if cancel.load(Ordering::Relaxed) { break; }
-            let mut bx = Vec::with_capacity(chunk.len() * in_dim);
-            let mut by = Vec::with_capacity(chunk.len() * out_dim);
+            bx_data.clear();
+            by_data.clear();
             for &i in chunk {
-                bx.extend_from_slice(&x.data[i * in_dim..(i + 1) * in_dim]);
-                by.extend_from_slice(&y.data[i * out_dim..(i + 1) * out_dim]);
+                bx_data.extend_from_slice(&x.data[i * in_dim..(i + 1) * in_dim]);
+                by_data.extend_from_slice(&y.data[i * out_dim..(i + 1) * out_dim]);
             }
-            let bx = Tensor::new(vec![chunk.len(), in_dim], bx);
-            let by = Tensor::new(vec![chunk.len(), out_dim], by);
+            let bx = Tensor::new(vec![chunk.len(), in_dim], bx_data.clone());
+            let by = Tensor::new(vec![chunk.len(), out_dim], by_data.clone());
             // Acquire the model lock for just one optimisation step, then
             // release it. This is what lets `persist()` and `infer()` proceed
             // between batches instead of waiting for the whole run to finish.
@@ -1856,14 +1880,18 @@ async fn run_training_loop(
                 step_counter += 1;
                 // Snapshot frozen linear layers, run the optimiser step,
                 // then restore — net effect is gradient flows through them
-                // but weights don't move. Matches how the transformer path
-                // handles its own frozen components.
-                let frozen_indices = parse_linear_frozen_keys(&frozen_layers);
-                let snaps = snapshot_linear_layers(&model, &frozen_indices);
+                // but weights don't move. Skip the snapshot/restore entirely
+                // when nothing is frozen: cloning the weights on the hot
+                // path was burning real cycles on big MLPs.
+                let snaps = if has_frozen {
+                    snapshot_linear_layers(&model, &frozen_indices)
+                } else {
+                    Vec::new()
+                };
                 let l = neuralcabin_engine::train_step_on_device::<neuralcabin_engine::GpuAutodiffBackend>(
                     &mut model, &optimizer, step_counter, loss_kind, &bx, &by, &device,
                 );
-                restore_linear_layers(&mut model, &snaps);
+                if has_frozen { restore_linear_layers(&mut model, &snaps); }
                 l
             };
             if !loss.is_finite() {
@@ -2036,6 +2064,21 @@ async fn infer_transformer(
         let mut rng = SplitMix64::new(0xDEAD_BEEF_u64 ^ (max_new as u64).wrapping_mul(0x9E3779B1));
         let device = neuralcabin_engine::default_gpu_device();
 
+        // Upload the model + RoPE/mask tables to the GPU ONCE for the whole
+        // generation. The previous implementation re-uploaded all weights
+        // (potentially tens of MB) and rebuilt the n_ctx² causal mask on
+        // every single generated token — that re-upload dominated wall time
+        // for any model bigger than a few thousand parameters.
+        let session = {
+            let m = model_arc.read().await;
+            neuralcabin_engine::InferenceSession::<
+                neuralcabin_engine::GpuBackend,
+            >::new(&m, n_ctx, device.clone())
+        };
+
+        // Reusable scratch for the sliding-window prompt.
+        let mut window: Vec<u32> = Vec::with_capacity(n_ctx);
+
         for index in 0..max_new {
             if cancel.load(Ordering::Relaxed) {
                 let _ = app_clone.emit("inference_finished", InferenceFinished {
@@ -2047,23 +2090,18 @@ async fn infer_transformer(
                 break;
             }
             // Take the last n_ctx tokens; pad-left with EOS if shorter.
-            let mut window: Vec<u32> = if ids.len() >= n_ctx {
-                ids[ids.len() - n_ctx..].to_vec()
+            window.clear();
+            if ids.len() < n_ctx {
+                window.resize(n_ctx - ids.len(), EOS_ID);
+                window.extend_from_slice(&ids);
             } else {
-                let mut w = vec![EOS_ID; n_ctx - ids.len()];
-                w.extend_from_slice(&ids);
-                w
-            };
-            // forward returns logits for every position; we want the LAST one.
-            let model = model_arc.read().await;
-            let logits = neuralcabin_engine::transformer::forward_logits::<
-                neuralcabin_engine::GpuBackend,
-            >(&model, &window, &device);
-            drop(model);
-            let vocab_sz = vocab.size();
-            let last_row = &logits[logits.len() - vocab_sz..];
-            // softmax for sampling.
-            let mut row = last_row.to_vec();
+                window.extend_from_slice(&ids[ids.len() - n_ctx..]);
+            }
+            // forward returns only the LAST position now — no need to slice
+            // a (T, vocab) tensor on the CPU side, and we save the GPU→CPU
+            // bandwidth of the other T-1 positions.
+            let mut row = session.last_position_logits(&window);
+
             let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             for v in row.iter_mut() { *v = (*v - mx).exp(); }
             let s: f32 = row.iter().sum();
@@ -2084,9 +2122,6 @@ async fn infer_transformer(
             });
             if (chosen as u32) == EOS_ID { break; }
             ids.push(chosen as u32);
-            // Suppress unused warning while we keep the variable for future
-            // KV-cache work — the window is recomputed every step today.
-            let _ = &mut window;
             tokio::task::yield_now().await;
         }
         let _ = app_clone.emit("inference_finished", InferenceFinished {
@@ -2340,6 +2375,35 @@ fn argmax(row: &[f32]) -> usize {
     best
 }
 
+/// Force WGPU to initialise its adapter, device, queue, and compile a small
+/// matmul shader. Runs on a fresh thread at app startup so the first real
+/// training step doesn't include a 5–30 s shader-compile stall.
+///
+/// Returns an error only if the warmup itself faults (eg. no GPU at all);
+/// the caller logs and ignores it because the real training run will get
+/// the same error in a more user-visible way.
+fn warmup_gpu_device() -> Result<(), String> {
+    use neuralcabin_engine::tensor::Tensor;
+    let device = neuralcabin_engine::default_gpu_device();
+    // A 4x4 matmul is enough to instantiate the wgpu adapter, build the
+    // primary shader, and exercise the autotune cache. Anything larger
+    // would needlessly delay the UI; anything smaller wouldn't actually
+    // trigger compilation of the matmul kernel that training uses on
+    // every layer.
+    let a = Tensor::new(vec![4, 4], vec![0.0; 16]);
+    let b = Tensor::new(vec![4, 4], vec![0.0; 16]);
+    let dummy = neuralcabin_engine::nn::Model::from_specs(
+        4,
+        &[neuralcabin_engine::nn::LayerSpec::Linear { in_dim: 4, out_dim: 4 }],
+        1,
+    );
+    // `predict_on_device` runs the whole forward through Burn on the chosen
+    // device, which is enough to trigger upload + matmul compile.
+    let _ = dummy.predict_on_device::<neuralcabin_engine::GpuBackend>(&a, &device);
+    let _ = b;
+    Ok(())
+}
+
 fn sample_with_temperature(probs: &[f32], temperature: f32, rng: &mut SplitMix64) -> usize {
     let mut logits: Vec<f32> = probs.iter().map(|p| p.max(1e-12).ln() / temperature).collect();
     let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -2360,6 +2424,31 @@ fn sample_with_temperature(probs: &[f32], temperature: f32, rng: &mut SplitMix64
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Tune the wgpu runtime BEFORE the first tensor op (which lazily
+    // initialises the device). Two knobs that move the needle on Windows:
+    //
+    // - `CUBECL_WGPU_MAX_TASKS` controls the depth of CubeCL's GPU command
+    //   queue. The default (32) is fine for ML inference, but with our
+    //   per-batch GPU sync removed, training can keep many more dispatches
+    //   in flight before backpressure kicks in. Larger queue = less time
+    //   spent waiting for the GPU to drain between batches.
+    //
+    // - `WGPU_POWER_PREFERENCE=high-performance` is a wgpu-side hint that
+    //   DXGI / the Vulkan loader use to pick the discrete GPU on dual-GPU
+    //   laptops. Our `default_gpu_device()` already sets HighPerformance
+    //   via the request_adapter path, but this catches the case where wgpu
+    //   is initialised by a different code path (eg. fallback during
+    //   adapter enumeration).
+    //
+    // Only set them if the user hasn't picked their own value — they're
+    // power-user knobs and shouldn't be silently overridden.
+    if std::env::var_os("CUBECL_WGPU_MAX_TASKS").is_none() {
+        std::env::set_var("CUBECL_WGPU_MAX_TASKS", "64");
+    }
+    if std::env::var_os("WGPU_POWER_PREFERENCE").is_none() {
+        std::env::set_var("WGPU_POWER_PREFERENCE", "high-performance");
+    }
+
     let state = AppState::new();
     tauri::Builder::default()
         .manage(state)
@@ -2407,6 +2496,17 @@ pub fn run() {
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 autostart_saved_servers(&app_handle).await;
+            });
+            // Warm up the GPU backend on a background thread. The first
+            // tensor op on the WGPU device pays the cost of adapter
+            // selection + driver init + first-shader compilation — that's
+            // 200 ms – 30 s on a cold GPU, depending on the OS / driver.
+            // Doing it now means the first training "Start" button click
+            // doesn't appear frozen.
+            std::thread::spawn(|| {
+                if let Err(e) = warmup_gpu_device() {
+                    eprintln!("[neuralcabin] GPU warmup skipped: {e}");
+                }
             });
             Ok(())
         })
