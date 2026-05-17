@@ -93,7 +93,10 @@ export interface PluginRegistry {
   context: PluginContext
 }
 
-export function usePluginRegistry(refreshNetworks: () => Promise<void>): PluginRegistry {
+export function usePluginRegistry(
+  refreshNetworks: () => Promise<void>,
+  selectNetwork: (networkId: string) => void,
+): PluginRegistry {
   const [installed, setInstalled] = useState<InstalledPlugin[]>(() => loadInstalled())
   const [tags, setTags] = useState<Record<string, string>>(() => loadNetworkTags())
   const [, setBump] = useState(0)
@@ -152,6 +155,7 @@ export function usePluginRegistry(refreshNetworks: () => Promise<void>): PluginR
 
   const context: PluginContext = {
     refreshNetworks,
+    selectNetwork,
     tagNetwork: (networkId, typeId) => {
       const next = { ...tags, [networkId]: typeId }
       setTags(next); saveNetworkTags(next)

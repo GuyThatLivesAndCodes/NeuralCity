@@ -19,6 +19,10 @@ import type { Network } from '../api'
 export interface PluginContext {
   /** Refresh the network list in the header dropdown. */
   refreshNetworks: () => Promise<void>
+  /** Programmatically change the selected network (used e.g. when a plugin
+   * rebuilds a network to grow its output dim and wants to keep the user on
+   * the new id without forcing them to re-pick from the dropdown). */
+  selectNetwork: (networkId: string) => void
   /** Mark a network as managed by this plugin's type. */
   tagNetwork: (networkId: string, typeId: string) => void
   /** Get/set arbitrary per-network plugin metadata (JSON-serializable). */

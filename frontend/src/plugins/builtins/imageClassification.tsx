@@ -17,11 +17,47 @@ interface ImageClassMeta {
   classes: string[]
   /** Saved corpus samples: { pixels (flat 0..1), label }. */
   samples: { pixels: number[]; classIdx: number }[]
+  /** Create-time hyperparams, preserved so we can rebuild the underlying
+   * feed-forward network if the class count later changes. */
+  name: string
+  hiddenSpec: string
+  outputAct: Activation
+  seed: number
 }
 
-const DEFAULT_META = (sizeX: number, sizeY: number, colored: boolean): ImageClassMeta => ({
+const DEFAULT_META = (
+  sizeX: number, sizeY: number, colored: boolean,
+  name = 'image-classifier', hiddenSpec = '64,relu,32,relu',
+  outputAct: Activation = 'softmax', seed = 42,
+): ImageClassMeta => ({
   sizeX, sizeY, colored, classes: [], samples: [],
+  name, hiddenSpec, outputAct, seed,
 })
+
+/** Parse `"64,relu,32,relu"` into a layer list given an input dim and a final
+ * output dim. Shared between the create form and the rebuild path so both
+ * routes produce byte-identical architectures. */
+function buildLayers(
+  inputDim: number, outputDim: number, hiddenSpec: string, outputAct: Activation,
+): any[] {
+  const layers: any[] = []
+  let cur = inputDim
+  const parts = hiddenSpec.split(',').map(s => s.trim()).filter(Boolean)
+  for (const p of parts) {
+    if (['relu', 'sigmoid', 'tanh', 'softmax', 'identity'].includes(p)) {
+      layers.push({ type: 'activation', activation: p })
+    } else if (/^\d+$/.test(p)) {
+      const n = parseInt(p, 10)
+      layers.push({ type: 'linear', in_dim: cur, out_dim: n })
+      cur = n
+    } else {
+      throw new Error(`unknown hidden-layer token '${p}'`)
+    }
+  }
+  layers.push({ type: 'linear', in_dim: cur, out_dim: Math.max(1, outputDim) })
+  if (outputAct !== 'identity') layers.push({ type: 'activation', activation: outputAct })
+  return layers
+}
 
 // ─── Helpers: image <-> feature-vector ───────────────────────────────────────
 
@@ -206,28 +242,15 @@ function CreateForm({ context, onCreated }: CreateFormProps) {
   const create = async () => {
     setError(null); setBusy(true)
     try {
-      const layers: any[] = []
-      let cur = inputDim
-      const parts = hidden.split(',').map(s => s.trim()).filter(Boolean)
-      for (const p of parts) {
-        if (['relu', 'sigmoid', 'tanh', 'softmax', 'identity'].includes(p)) {
-          layers.push({ type: 'activation', activation: p })
-        } else if (/^\d+$/.test(p)) {
-          const n = parseInt(p, 10)
-          layers.push({ type: 'linear', in_dim: cur, out_dim: n })
-          cur = n
-        } else {
-          throw new Error(`unknown spec token '${p}'`)
-        }
-      }
-      layers.push({ type: 'linear', in_dim: cur, out_dim: Math.max(1, numClasses) })
-      if (outputAct !== 'identity') layers.push({ type: 'activation', activation: outputAct })
-
+      const layers = buildLayers(inputDim, Math.max(1, numClasses), hidden, outputAct)
       const net = await networks.create({
         name, kind: 'feedforward', seed, layers, input_dim: inputDim,
       })
       context.tagNetwork(net.id, 'image-classification')
-      context.setMeta<ImageClassMeta>(net.id, DEFAULT_META(sizeX, sizeY, colored))
+      context.setMeta<ImageClassMeta>(
+        net.id,
+        DEFAULT_META(sizeX, sizeY, colored, name, hidden, outputAct, seed),
+      )
       await context.refreshNetworks()
       onCreated(net.id)
     } catch (e) {
@@ -305,6 +328,10 @@ function loadMeta(context: NetworkTypeRenderProps['context'], networkId: string)
     colored: m?.colored ?? false,
     classes: Array.isArray(m?.classes) ? m!.classes! : [],
     samples: Array.isArray(m?.samples) ? m!.samples! : [],
+    name: m?.name ?? 'image-classifier',
+    hiddenSpec: m?.hiddenSpec ?? '64,relu,32,relu',
+    outputAct: (m?.outputAct as Activation) ?? 'softmax',
+    seed: m?.seed ?? 42,
   }
 }
 
@@ -381,6 +408,32 @@ function CorpusUI({ network, context }: NetworkTypeRenderProps) {
       if (meta.classes.length === 0) throw new Error('add at least one class first')
       const inDim = featureDim(meta)
       const outDim = meta.classes.length
+
+      // The underlying feed-forward network's output_dim is fixed at create
+      // time, but the user can add classes after the fact. If the class count
+      // has drifted, rebuild the network so its output layer matches before
+      // we save the corpus — otherwise the backend rejects with a shape
+      // mismatch ("feedforward out_dim N doesn't match network output_dim M").
+      let targetNetworkId = network.id
+      if (network.output_dim !== outDim) {
+        if (network.trained) {
+          throw new Error(
+            `Class count (${outDim}) doesn't match the trained network's output dim (${network.output_dim}). ` +
+            `Rebuilding would discard trained weights — delete the network manually and create a new one if that's what you want.`,
+          )
+        }
+        const layers = buildLayers(inDim, outDim, meta.hiddenSpec, meta.outputAct)
+        const fresh = await networks.create({
+          name: meta.name, kind: 'feedforward', seed: meta.seed,
+          layers, input_dim: inDim,
+        })
+        // Re-tag, copy meta to the new id, then delete the old empty network.
+        context.tagNetwork(fresh.id, 'image-classification')
+        context.setMeta<ImageClassMeta>(fresh.id, meta)
+        try { await networks.delete(network.id) } catch { /* best-effort cleanup */ }
+        targetNetworkId = fresh.id
+      }
+
       const features: number[] = []
       const targets: number[] = []
       for (const s of meta.samples) {
@@ -388,14 +441,24 @@ function CorpusUI({ network, context }: NetworkTypeRenderProps) {
         for (let i = 0; i < outDim; i++) targets.push(i === s.classIdx ? 1 : 0)
       }
       await corpus.set({
-        network_id: network.id,
+        network_id: targetNetworkId,
         feedforward: {
           features, targets,
           rows: meta.samples.length,
           in_dim: inDim, out_dim: outDim,
         },
       })
-      setStatus(`Saved ${meta.samples.length} samples × ${outDim} classes to the backend.`)
+
+      if (targetNetworkId !== network.id) {
+        await context.refreshNetworks()
+        context.selectNetwork(targetNetworkId)
+        setStatus(
+          `Output dim grew from ${network.output_dim} to ${outDim}; rebuilt the network and ` +
+          `saved ${meta.samples.length} samples to it.`,
+        )
+      } else {
+        setStatus(`Saved ${meta.samples.length} samples × ${outDim} classes to the backend.`)
+      }
     } catch (e) { setError(String(e)) }
   }
 
@@ -405,6 +468,14 @@ function CorpusUI({ network, context }: NetworkTypeRenderProps) {
     <>
       <div className="card">
         <h3>Classes</h3>
+        {meta.classes.length !== network.output_dim && meta.classes.length > 0 && (
+          <div className="status mt-1">
+            Network currently has <strong>{network.output_dim}</strong> output neuron(s) but you have <strong>{meta.classes.length}</strong> class(es).
+            {network.trained
+              ? ' The network is trained — saving will fail until classes match. Create a new network if you need more outputs.'
+              : ' Saving the corpus will automatically rebuild the network with the new output dim.'}
+          </div>
+        )}
         <div className="flex" style={{ gap: 8, marginBottom: 12 }}>
           <input
             value={newClass} onChange={e => setNewClass(e.target.value)}

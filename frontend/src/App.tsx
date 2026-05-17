@@ -54,7 +54,7 @@ export default function App() {
   useEffect(() => { void refresh() }, [refresh])
   useEffect(() => { applySettings(loadSettings()) }, [])
 
-  const pluginRegistry = usePluginRegistry(refresh)
+  const pluginRegistry = usePluginRegistry(refresh, setSelectedId)
 
   const selected = list.find(n => n.id === selectedId) ?? null
   const props: TabProps = { network: selected, refreshNetworks: refresh, pluginRegistry }
