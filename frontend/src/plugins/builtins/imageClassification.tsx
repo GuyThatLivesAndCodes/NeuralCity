@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { networks, corpus, inference, type Activation } from '../../api'
 import NetworkViz from '../../components/NetworkViz'
+import { idbKV } from '../storage'
 import type {
   NeuralCabinPlugin,
   NetworkTypeDescriptor,
@@ -10,13 +11,12 @@ import type {
 
 // ─── Per-network metadata (stored in plugin meta) ─────────────────────────────
 
+/** Small bookkeeping persisted via the host's localStorage-backed meta API. */
 interface ImageClassMeta {
   sizeX: number
   sizeY: number
   colored: boolean
   classes: string[]
-  /** Saved corpus samples: { pixels (flat 0..1), label }. */
-  samples: { pixels: number[]; classIdx: number }[]
   /** Create-time hyperparams, preserved so we can rebuild the underlying
    * feed-forward network if the class count later changes. */
   name: string
@@ -25,12 +25,22 @@ interface ImageClassMeta {
   seed: number
 }
 
+/** A single image sample. Pixel data is too big for localStorage (a 64×64 RGB
+ * sample is ~12k floats), so samples are persisted in IndexedDB keyed by
+ * network id — see `samplesKey` below. */
+interface ImageSample { pixels: number[]; classIdx: number }
+
+const samplesKey = (networkId: string) => `image-classification.samples.${networkId}`
+const loadSamples = (id: string) => idbKV.get<ImageSample[]>(samplesKey(id)).then(v => v ?? [])
+const saveSamples = (id: string, s: ImageSample[]) => idbKV.set(samplesKey(id), s)
+const deleteSamples = (id: string) => idbKV.delete(samplesKey(id))
+
 const DEFAULT_META = (
   sizeX: number, sizeY: number, colored: boolean,
   name = 'image-classifier', hiddenSpec = '64,relu,32,relu',
   outputAct: Activation = 'softmax', seed = 42,
 ): ImageClassMeta => ({
-  sizeX, sizeY, colored, classes: [], samples: [],
+  sizeX, sizeY, colored, classes: [],
   name, hiddenSpec, outputAct, seed,
 })
 
@@ -319,15 +329,16 @@ function CreateForm({ context, onCreated }: CreateFormProps) {
 // ─── Corpus UI ───────────────────────────────────────────────────────────────
 
 function loadMeta(context: NetworkTypeRenderProps['context'], networkId: string): ImageClassMeta {
+  // The host's meta store may carry a legacy `samples` field from earlier
+  // versions of this plugin (when samples lived in localStorage). We don't
+  // restore it here — `useSamples` migrates it into IDB asynchronously and
+  // strips it out so we never re-hit the quota.
   const m = context.getMeta<Partial<ImageClassMeta>>(networkId)
-  // Defensive: an older or corrupt meta entry could be missing fields. Coerce
-  // to a fully-populated value so rendering never throws on `.classes` etc.
   return {
     sizeX: m?.sizeX ?? 16,
     sizeY: m?.sizeY ?? 16,
     colored: m?.colored ?? false,
     classes: Array.isArray(m?.classes) ? m!.classes! : [],
-    samples: Array.isArray(m?.samples) ? m!.samples! : [],
     name: m?.name ?? 'image-classifier',
     hiddenSpec: m?.hiddenSpec ?? '64,relu,32,relu',
     outputAct: (m?.outputAct as Activation) ?? 'softmax',
@@ -335,8 +346,54 @@ function loadMeta(context: NetworkTypeRenderProps['context'], networkId: string)
   }
 }
 
+/** Manage `samples` for a network: load from IDB on mount, migrate any
+ * legacy localStorage-backed samples on the first run, persist updates back
+ * to IDB. Returns the live list, a setter, and a "ready" flag so the UI can
+ * avoid showing a misleadingly-empty state during the initial load. */
+function useSamples(
+  context: NetworkTypeRenderProps['context'],
+  networkId: string,
+): [ImageSample[], (next: ImageSample[]) => void, boolean] {
+  const [samples, setSamplesState] = useState<ImageSample[]>([])
+  const [ready, setReady] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    setReady(false)
+    ;(async () => {
+      let loaded = await loadSamples(networkId).catch(() => [])
+      // One-time migration: legacy meta had `samples` inline. Pull them out
+      // of localStorage, move them into IDB, and rewrite meta without them.
+      const legacy = context.getMeta<{ samples?: ImageSample[] }>(networkId)
+      if (legacy?.samples && legacy.samples.length > 0 && loaded.length === 0) {
+        loaded = legacy.samples
+        try { await saveSamples(networkId, loaded) } catch { /* leave inline as fallback */ }
+        const { samples: _omit, ...rest } = legacy as any
+        context.setMeta(networkId, rest)
+      }
+      if (!cancelled) {
+        setSamplesState(loaded)
+        setReady(true)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [networkId])
+
+  const setSamples = useCallback((next: ImageSample[]) => {
+    setSamplesState(next)
+    // Fire-and-forget; errors here (e.g. IDB full) should be surfaced by the
+    // caller via the corpus-save path rather than crash the UI.
+    void saveSamples(networkId, next).catch(err => {
+      console.error('[image-classification] failed to persist samples', err)
+    })
+  }, [networkId])
+
+  return [samples, setSamples, ready]
+}
+
 function CorpusUI({ network, context }: NetworkTypeRenderProps) {
   const [meta, setMeta] = useState<ImageClassMeta>(() => loadMeta(context, network.id))
+  const [samples, setSamples, samplesReady] = useSamples(context, network.id)
   const [newClass, setNewClass] = useState('')
   const [selectedClass, setSelectedClass] = useState<number>(0)
   const [status, setStatus] = useState<string | null>(null)
@@ -362,17 +419,19 @@ function CorpusUI({ network, context }: NetworkTypeRenderProps) {
   }
 
   const removeClass = (idx: number) => {
-    const samples = meta.samples
+    const nextSamples = samples
       .filter(s => s.classIdx !== idx)
       .map(s => ({ ...s, classIdx: s.classIdx > idx ? s.classIdx - 1 : s.classIdx }))
-    setMeta({ ...meta, classes: meta.classes.filter((_, i) => i !== idx), samples })
+    setMeta({ ...meta, classes: meta.classes.filter((_, i) => i !== idx) })
+    setSamples(nextSamples)
     if (selectedClass >= meta.classes.length - 1) setSelectedClass(0)
   }
 
   const addSample = (pixels: number[]) => {
     if (meta.classes.length === 0) { setError('add at least one class first'); return }
-    setMeta(m => ({ ...m, samples: [...m.samples, { pixels, classIdx: selectedClass }] }))
-    setStatus(`Added sample for "${meta.classes[selectedClass]}" (${meta.samples.length + 1} total)`)
+    const next = [...samples, { pixels, classIdx: selectedClass }]
+    setSamples(next)
+    setStatus(`Added sample for "${meta.classes[selectedClass]}" (${next.length} total)`)
   }
 
   const onUpload = async (files: FileList | null) => {
@@ -404,7 +463,7 @@ function CorpusUI({ network, context }: NetworkTypeRenderProps) {
   const saveCorpusToBackend = async () => {
     setError(null); setStatus(null)
     try {
-      if (meta.samples.length === 0) throw new Error('add some samples first')
+      if (samples.length === 0) throw new Error('add some samples first')
       if (meta.classes.length === 0) throw new Error('add at least one class first')
       const inDim = featureDim(meta)
       const outDim = meta.classes.length
@@ -427,16 +486,18 @@ function CorpusUI({ network, context }: NetworkTypeRenderProps) {
           name: meta.name, kind: 'feedforward', seed: meta.seed,
           layers, input_dim: inDim,
         })
-        // Re-tag, copy meta to the new id, then delete the old empty network.
+        // Re-tag, copy meta + move samples to the new id, then delete the old.
         context.tagNetwork(fresh.id, 'image-classification')
         context.setMeta<ImageClassMeta>(fresh.id, meta)
-        try { await networks.delete(network.id) } catch { /* best-effort cleanup */ }
+        try { await saveSamples(fresh.id, samples) } catch { /* best-effort */ }
+        try { await deleteSamples(network.id) } catch { /* best-effort */ }
+        try { await networks.delete(network.id) } catch { /* best-effort */ }
         targetNetworkId = fresh.id
       }
 
       const features: number[] = []
       const targets: number[] = []
-      for (const s of meta.samples) {
+      for (const s of samples) {
         features.push(...s.pixels)
         for (let i = 0; i < outDim; i++) targets.push(i === s.classIdx ? 1 : 0)
       }
@@ -444,7 +505,7 @@ function CorpusUI({ network, context }: NetworkTypeRenderProps) {
         network_id: targetNetworkId,
         feedforward: {
           features, targets,
-          rows: meta.samples.length,
+          rows: samples.length,
           in_dim: inDim, out_dim: outDim,
         },
       })
@@ -454,15 +515,15 @@ function CorpusUI({ network, context }: NetworkTypeRenderProps) {
         context.selectNetwork(targetNetworkId)
         setStatus(
           `Output dim grew from ${network.output_dim} to ${outDim}; rebuilt the network and ` +
-          `saved ${meta.samples.length} samples to it.`,
+          `saved ${samples.length} samples to it.`,
         )
       } else {
-        setStatus(`Saved ${meta.samples.length} samples × ${outDim} classes to the backend.`)
+        setStatus(`Saved ${samples.length} samples × ${outDim} classes to the backend.`)
       }
     } catch (e) { setError(String(e)) }
   }
 
-  const samplesByClass = meta.classes.map((_, i) => meta.samples.filter(s => s.classIdx === i).length)
+  const samplesByClass = meta.classes.map((_, i) => samples.filter(s => s.classIdx === i).length)
 
   return (
     <>
@@ -544,8 +605,12 @@ function CorpusUI({ network, context }: NetworkTypeRenderProps) {
         <p className="muted">
           Encodes samples as a feedforward corpus ({featureDim(meta)} input dims, one-hot targets) and
           writes it to the engine so training can pick it up.
+          {' '}
+          {samplesReady
+            ? `${samples.length} sample(s) ready.`
+            : 'Loading samples…'}
         </p>
-        <button onClick={saveCorpusToBackend}>Save corpus</button>
+        <button onClick={saveCorpusToBackend} disabled={!samplesReady}>Save corpus</button>
         {status && <div className="status mt-1">{status}</div>}
         {error && <div className="status error mt-1">{error}</div>}
       </div>
