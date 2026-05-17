@@ -20,11 +20,16 @@ use crate::optimizer::OptimizerKind;
 use crate::tensor::{SplitMix64, Tensor};
 use burn::module::{Module, Param};
 use burn::nn::loss::CrossEntropyLossConfig;
-use burn::optim::{AdamConfig, AdamWConfig, GradientsParams, Optimizer as BurnOptimizer, SgdConfig};
+use burn::optim::adaptor::OptimizerAdaptor;
+use burn::optim::{
+    Adam, AdamConfig, AdamW, AdamWConfig, GradientsParams, Optimizer as BurnOptimizer, Sgd,
+    SgdConfig,
+};
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Int, Tensor as BT, TensorData};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransformerConfig {
@@ -154,9 +159,21 @@ impl<B: Backend> BurnTransformer<B> {
 
     /// Forward pass.
     /// - `tokens`: (batch, seq_len) Int tensor
+    /// - `cos`, `sin`: precomputed RoPE tables (T, head_dim/2)
+    /// - `mask`: precomputed causal mask (T, T)
     /// - returns logits: (batch, seq_len, vocab)
-    fn forward(&self, tokens: BT<B, 2, Int>, cfg: &TransformerConfig) -> BT<B, 3> {
-        let device = tokens.device();
+    ///
+    /// Passing the tables in (rather than rebuilding them every call) is what
+    /// the `TrainerSession` uses to avoid rebuilding ~seq_len² booleans plus
+    /// the trig tables on every training step.
+    fn forward(
+        &self,
+        tokens: BT<B, 2, Int>,
+        cfg: &TransformerConfig,
+        cos: &BT<B, 2>,
+        sin: &BT<B, 2>,
+        mask: &BT<B, 2, burn::tensor::Bool>,
+    ) -> BT<B, 3> {
         let [batch, seq_len] = tokens.dims();
         let n_embd = cfg.n_embd;
         let n_heads = cfg.n_heads;
@@ -166,14 +183,6 @@ impl<B: Backend> BurnTransformer<B> {
         let flat = tokens.reshape([batch * seq_len]);
         let embedded: BT<B, 2> = self.token_embd.val().select(0, flat);
         let mut h: BT<B, 3> = embedded.reshape([batch, seq_len, n_embd]);
-
-        // Precompute RoPE cos/sin for this sequence: (T, head_dim/2)
-        let (cos, sin) = rope_tables::<B>(seq_len, head_dim, cfg.rope_theta, &device);
-
-        // Pre-build causal mask (T, T): True at positions to keep (j <= i).
-        // We invert when calling mask_fill (it fills where mask is True, so
-        // we mark positions j > i and fill them with -inf).
-        let mask = causal_mask::<B>(seq_len, &device);
 
         for block in &self.blocks {
             // Attention sub-layer.
@@ -191,8 +200,8 @@ impl<B: Backend> BurnTransformer<B> {
             let v = v_2d.reshape([batch, seq_len, n_heads, head_dim]).swap_dims(1, 2);
 
             // Apply RoPE to q and k. cos/sin: (T, head_dim/2) — broadcast over (B, H).
-            let q = apply_rope::<B>(q, &cos, &sin);
-            let k = apply_rope::<B>(k, &cos, &sin);
+            let q = apply_rope::<B>(q, cos, sin);
+            let k = apply_rope::<B>(k, cos, sin);
 
             // Scaled dot-product: (B, H, T, head_dim) x (B, H, head_dim, T)
             let scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -390,7 +399,10 @@ pub fn train_step_on_device<B: AutodiffBackend>(
     );
 
     // Forward: (B, T, vocab)
-    let logits = net.forward(x, &cfg);
+    let head_dim = cfg.n_embd / cfg.n_heads;
+    let (cos, sin) = rope_tables::<B>(seq_len, head_dim, cfg.rope_theta, device);
+    let mask = causal_mask::<B>(seq_len, device);
+    let logits = net.forward(x, &cfg, &cos, &sin, &mask);
     let vocab = cfg.vocab_size;
 
     // Loss: cross-entropy averaged over (B*T) positions.
@@ -441,6 +453,253 @@ fn step_with_optimizer<B: AutodiffBackend>(
     }
 }
 
+// ─── Persistent trainer session ─────────────────────────────────────────────
+
+/// Burn optimizer state for a single training run. Built once at the start
+/// of training and reused for every step so Adam/AdamW/LAMB actually keep
+/// their momentum and variance buffers between steps.
+///
+/// The previous implementation re-created the optimizer on every call to
+/// `train_step_on_device`, which silently turned Adam into LR-scaled SGD with
+/// constant zero moments — meaning the network never actually converged in
+/// the way the hyperparameters implied, so training ran far longer than it
+/// should have. Keeping the optimizer alive is the single biggest speedup.
+enum OptVariant<B: AutodiffBackend> {
+    Sgd(OptimizerAdaptor<Sgd<B::InnerBackend>, BurnTransformer<B>, B>),
+    Adam(OptimizerAdaptor<Adam, BurnTransformer<B>, B>),
+    AdamW(OptimizerAdaptor<AdamW, BurnTransformer<B>, B>),
+}
+
+/// A long-lived training session for a single `TransformerModel` on a single
+/// device. Holds:
+///
+/// - The Burn module (`BurnTransformer<B>`) so its parameters live on the
+///   GPU for the whole run instead of being uploaded every step.
+/// - The optimizer, with its momentum/variance state preserved across steps.
+/// - Pre-built RoPE cos/sin tables and the causal mask for the run's
+///   `seq_len`, so we don't re-fill seq_len² booleans on each step.
+///
+/// Call `step` per batch; call `write_back` periodically (e.g. once per
+/// epoch) to sync the GPU weights to the CPU `TransformerModel` for
+/// persistence, checkpointing, or inference.
+pub struct TrainerSession<B: AutodiffBackend> {
+    /// `Option` because `BurnOptimizer::step` takes the module by value and
+    /// returns the updated one — we `take()`, step, and put it back.
+    net: Option<BurnTransformer<B>>,
+    opt: OptVariant<B>,
+    cfg: TransformerConfig,
+    device: B::Device,
+    lr: f64,
+    seq_len: usize,
+    cos: BT<B, 2>,
+    sin: BT<B, 2>,
+    mask: BT<B, 2, burn::tensor::Bool>,
+}
+
+/// On-device snapshot of frozen parameters. Cheap to capture (Burn tensors
+/// are reference-counted) and avoids a full GPU→CPU→GPU round trip.
+pub struct FrozenSnapshotGpu<B: AutodiffBackend> {
+    embedding: Option<BT<B, 2>>,
+    output_norm: Option<BT<B, 1>>,
+    output: Option<BT<B, 2>>,
+    blocks: HashMap<usize, BlockSnapshot<B>>,
+}
+
+struct BlockSnapshot<B: AutodiffBackend> {
+    attn_norm: BT<B, 1>,
+    wq: BT<B, 2>,
+    wk: BT<B, 2>,
+    wv: BT<B, 2>,
+    wo: BT<B, 2>,
+    ffn_norm: BT<B, 1>,
+    ffn_gate: BT<B, 2>,
+    ffn_up:   BT<B, 2>,
+    ffn_down: BT<B, 2>,
+}
+
+impl<B: AutodiffBackend> TrainerSession<B> {
+    /// Build a session: upload the model to `device` once, build the
+    /// optimizer once, precompute RoPE/mask once.
+    pub fn new(
+        model: &TransformerModel,
+        kind: &OptimizerKind,
+        seq_len: usize,
+        device: B::Device,
+    ) -> Self {
+        let cfg = model.config.clone();
+        let net = BurnTransformer::<B>::from_model(model, &device);
+        let head_dim = cfg.n_embd / cfg.n_heads;
+        let (cos, sin) = rope_tables::<B>(seq_len, head_dim, cfg.rope_theta, &device);
+        let mask = causal_mask::<B>(seq_len, &device);
+        let (opt, lr) = build_opt::<B>(kind);
+        Self {
+            net: Some(net),
+            opt,
+            cfg,
+            device,
+            lr,
+            seq_len,
+            cos,
+            sin,
+            mask,
+        }
+    }
+
+    /// Update the learning rate for subsequent steps. Useful for LR schedules.
+    pub fn set_lr(&mut self, lr: f32) { self.lr = lr as f64; }
+
+    /// One training step on a flattened `(batch * seq_len)` input/target
+    /// pair. Returns the loss for monitoring.
+    pub fn step(&mut self, inputs: &[u32], targets: &[u32], batch: usize) -> f32 {
+        let seq_len = self.seq_len;
+        debug_assert_eq!(inputs.len(), batch * seq_len);
+        debug_assert_eq!(targets.len(), batch * seq_len);
+
+        // Move tokens to device as Int tensors. Small (B*T i64s), one of the
+        // few unavoidable per-step CPU→GPU transfers.
+        let input_i64: Vec<i64> = inputs.iter().map(|&t| t as i64).collect();
+        let target_i64: Vec<i64> = targets.iter().map(|&t| t as i64).collect();
+        let x = BT::<B, 2, Int>::from_data(
+            TensorData::new(input_i64, [batch, seq_len]),
+            &self.device,
+        );
+        let y = BT::<B, 2, Int>::from_data(
+            TensorData::new(target_i64, [batch, seq_len]),
+            &self.device,
+        );
+
+        let net = self.net.take().expect("session net is always Some between steps");
+        let logits = net.forward(x, &self.cfg, &self.cos, &self.sin, &self.mask);
+        let vocab = self.cfg.vocab_size;
+        let logits_flat = logits.reshape([batch * seq_len, vocab]);
+        let targets_flat = y.reshape([batch * seq_len]);
+        let loss_module = CrossEntropyLossConfig::new().init(&self.device);
+        let loss = loss_module.forward(logits_flat, targets_flat);
+        let loss_scalar: f32 = loss.clone().into_scalar().elem();
+
+        let grads = loss.backward();
+        let grads = GradientsParams::from_grads(grads, &net);
+
+        let lr = self.lr;
+        let updated = match &mut self.opt {
+            OptVariant::Sgd(o)   => o.step(lr, net, grads),
+            OptVariant::Adam(o)  => o.step(lr, net, grads),
+            OptVariant::AdamW(o) => o.step(lr, net, grads),
+        };
+        self.net = Some(updated);
+        loss_scalar
+    }
+
+    /// Mirror the live GPU parameters back into the CPU `TransformerModel`.
+    /// Cheap-ish but not free, so do this once per epoch / on checkpoint,
+    /// not per step.
+    pub fn write_back(&self, model: &mut TransformerModel) {
+        let net = self.net.as_ref().expect("session net is always Some between steps");
+        model.token_embd = Tensor::from_burn_2d::<B>(net.token_embd.val());
+        for (dst, b) in model.blocks.iter_mut().zip(net.blocks.iter()) {
+            dst.attn_norm = from_burn_1d::<B>(b.attn_norm.val());
+            dst.wq = Tensor::from_burn_2d::<B>(b.wq.val());
+            dst.wk = Tensor::from_burn_2d::<B>(b.wk.val());
+            dst.wv = Tensor::from_burn_2d::<B>(b.wv.val());
+            dst.wo = Tensor::from_burn_2d::<B>(b.wo.val());
+            dst.ffn_norm = from_burn_1d::<B>(b.ffn_norm.val());
+            dst.ffn_gate = Tensor::from_burn_2d::<B>(b.ffn_gate.val());
+            dst.ffn_up   = Tensor::from_burn_2d::<B>(b.ffn_up.val());
+            dst.ffn_down = Tensor::from_burn_2d::<B>(b.ffn_down.val());
+        }
+        model.output_norm = from_burn_1d::<B>(net.output_norm.val());
+        model.output = Tensor::from_burn_2d::<B>(net.output.val());
+    }
+
+    /// Snapshot the chosen parameters straight off the device so they can
+    /// be restored verbatim after the optimizer step (= frozen weights).
+    pub fn snapshot_frozen(
+        &self,
+        embedding: bool,
+        output_norm: bool,
+        output: bool,
+        block_ids: &[usize],
+    ) -> FrozenSnapshotGpu<B> {
+        let net = self.net.as_ref().expect("session net is always Some between steps");
+        let mut blocks = HashMap::new();
+        for &i in block_ids {
+            if let Some(b) = net.blocks.get(i) {
+                blocks.insert(i, BlockSnapshot {
+                    attn_norm: b.attn_norm.val(),
+                    wq: b.wq.val(),
+                    wk: b.wk.val(),
+                    wv: b.wv.val(),
+                    wo: b.wo.val(),
+                    ffn_norm: b.ffn_norm.val(),
+                    ffn_gate: b.ffn_gate.val(),
+                    ffn_up:   b.ffn_up.val(),
+                    ffn_down: b.ffn_down.val(),
+                });
+            }
+        }
+        FrozenSnapshotGpu {
+            embedding:   if embedding   { Some(net.token_embd.val()) }  else { None },
+            output_norm: if output_norm { Some(net.output_norm.val()) } else { None },
+            output:      if output      { Some(net.output.val()) }      else { None },
+            blocks,
+        }
+    }
+
+    /// Re-install a frozen-parameter snapshot. Called after each optimizer
+    /// step so frozen layers stay put while non-frozen layers update.
+    pub fn restore_frozen(&mut self, snap: &FrozenSnapshotGpu<B>) {
+        let net = self.net.as_mut().expect("session net is always Some between steps");
+        if let Some(t) = &snap.embedding {
+            net.token_embd = Param::from_tensor(t.clone());
+        }
+        if let Some(t) = &snap.output_norm {
+            net.output_norm = Param::from_tensor(t.clone());
+        }
+        if let Some(t) = &snap.output {
+            net.output = Param::from_tensor(t.clone());
+        }
+        for (&i, b) in &snap.blocks {
+            if let Some(dst) = net.blocks.get_mut(i) {
+                dst.attn_norm = Param::from_tensor(b.attn_norm.clone());
+                dst.wq = Param::from_tensor(b.wq.clone());
+                dst.wk = Param::from_tensor(b.wk.clone());
+                dst.wv = Param::from_tensor(b.wv.clone());
+                dst.wo = Param::from_tensor(b.wo.clone());
+                dst.ffn_norm = Param::from_tensor(b.ffn_norm.clone());
+                dst.ffn_gate = Param::from_tensor(b.ffn_gate.clone());
+                dst.ffn_up   = Param::from_tensor(b.ffn_up.clone());
+                dst.ffn_down = Param::from_tensor(b.ffn_down.clone());
+            }
+        }
+    }
+}
+
+fn build_opt<B: AutodiffBackend>(
+    kind: &OptimizerKind,
+) -> (OptVariant<B>, f64) {
+    match *kind {
+        OptimizerKind::Sgd { lr, momentum } => {
+            let cfg = if momentum > 0.0 {
+                SgdConfig::new().with_momentum(Some(burn::optim::momentum::MomentumConfig {
+                    momentum: momentum as f64, dampening: 0.0, nesterov: false,
+                }))
+            } else { SgdConfig::new() };
+            (OptVariant::Sgd(cfg.init::<B, BurnTransformer<B>>()), lr as f64)
+        }
+        OptimizerKind::Adam { lr, beta1, beta2, eps } => {
+            let cfg = AdamConfig::new().with_beta_1(beta1).with_beta_2(beta2).with_epsilon(eps);
+            (OptVariant::Adam(cfg.init::<B, BurnTransformer<B>>()), lr as f64)
+        }
+        OptimizerKind::AdamW { lr, beta1, beta2, eps, weight_decay }
+        | OptimizerKind::Lamb { lr, beta1, beta2, eps, weight_decay } => {
+            let cfg = AdamWConfig::new()
+                .with_beta_1(beta1).with_beta_2(beta2).with_epsilon(eps)
+                .with_weight_decay(weight_decay);
+            (OptVariant::AdamW(cfg.init::<B, BurnTransformer<B>>()), lr as f64)
+        }
+    }
+}
+
 // ─── CPU inference ──────────────────────────────────────────────────────────
 
 /// Compute logits at every position for a (single) sequence of `tokens`.
@@ -459,7 +718,10 @@ pub fn forward_logits<B: Backend>(
         TensorData::new(input_i64, [1, seq_len]),
         device,
     );
-    let logits = net.forward(x, &model.config); // (1, T, vocab)
+    let head_dim = model.config.n_embd / model.config.n_heads;
+    let (cos, sin) = rope_tables::<B>(seq_len, head_dim, model.config.rope_theta, device);
+    let mask = causal_mask::<B>(seq_len, device);
+    let logits = net.forward(x, &model.config, &cos, &sin, &mask); // (1, T, vocab)
     let logits = logits.reshape([seq_len * model.config.vocab_size]);
     logits.into_data().convert::<f32>().into_vec().unwrap()
 }
