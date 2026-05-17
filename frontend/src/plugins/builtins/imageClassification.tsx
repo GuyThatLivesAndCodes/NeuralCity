@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { networks, corpus, inference, type Activation } from '../../api'
 import NetworkViz from '../../components/NetworkViz'
 import type {
@@ -295,16 +295,35 @@ function CreateForm({ context, onCreated }: CreateFormProps) {
 
 // ─── Corpus UI ───────────────────────────────────────────────────────────────
 
+function loadMeta(context: NetworkTypeRenderProps['context'], networkId: string): ImageClassMeta {
+  const m = context.getMeta<Partial<ImageClassMeta>>(networkId)
+  // Defensive: an older or corrupt meta entry could be missing fields. Coerce
+  // to a fully-populated value so rendering never throws on `.classes` etc.
+  return {
+    sizeX: m?.sizeX ?? 16,
+    sizeY: m?.sizeY ?? 16,
+    colored: m?.colored ?? false,
+    classes: Array.isArray(m?.classes) ? m!.classes! : [],
+    samples: Array.isArray(m?.samples) ? m!.samples! : [],
+  }
+}
+
 function CorpusUI({ network, context }: NetworkTypeRenderProps) {
-  const initialMeta = useMemo(
-    () => context.getMeta<ImageClassMeta>(network.id) ?? DEFAULT_META(16, 16, false),
-    [network.id])
-  const [meta, setMeta] = useState<ImageClassMeta>(initialMeta)
+  const [meta, setMeta] = useState<ImageClassMeta>(() => loadMeta(context, network.id))
   const [newClass, setNewClass] = useState('')
   const [selectedClass, setSelectedClass] = useState<number>(0)
   const [status, setStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const drawRef = useRef<DrawPanelHandle | null>(null)
+
+  // Re-hydrate when the selected network changes; useState's initial value
+  // only fires once so without this we'd display stale meta after a switch.
+  useEffect(() => {
+    setMeta(loadMeta(context, network.id))
+    setSelectedClass(0)
+    setStatus(null)
+    setError(null)
+  }, [network.id])
 
   useEffect(() => { context.setMeta(network.id, meta) }, [meta, network.id])
 
@@ -466,7 +485,7 @@ function CorpusUI({ network, context }: NetworkTypeRenderProps) {
 // ─── Inference UI ────────────────────────────────────────────────────────────
 
 function InferenceUI({ network, context }: NetworkTypeRenderProps) {
-  const meta = context.getMeta<ImageClassMeta>(network.id) ?? DEFAULT_META(16, 16, false)
+  const [meta, setMetaState] = useState<ImageClassMeta>(() => loadMeta(context, network.id))
   const [mode, setMode] = useState<'draw' | 'upload'>('draw')
   const [realtime, setRealtime] = useState(false)
   const [showViz, setShowViz] = useState(true)
@@ -476,6 +495,11 @@ function InferenceUI({ network, context }: NetworkTypeRenderProps) {
   const drawRef = useRef<DrawPanelHandle | null>(null)
   const pendingRef = useRef(false)
   const queuedRef = useRef<number[] | null>(null)
+
+  useEffect(() => {
+    setMetaState(loadMeta(context, network.id))
+    setOutput(null); setActivations(null); setError(null)
+  }, [network.id])
 
   const runOnPixels = useCallback(async (pixels: number[]) => {
     setError(null)

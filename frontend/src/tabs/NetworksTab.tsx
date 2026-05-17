@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { networks, exporter, Activation, ExportFormat, Layer, Network, NetworkKind } from '../api'
 import type { TabProps } from '../App'
-import type { NetworkTypeDescriptor, PluginContext } from '../plugins/types'
+import PluginErrorBoundary from '../components/PluginErrorBoundary'
 
 const ACTIVATIONS: Activation[] = ['identity', 'relu', 'sigmoid', 'tanh', 'softmax']
 
@@ -121,6 +121,13 @@ export default function NetworksTab({ refreshNetworks, onSelect, pluginRegistry 
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState<FormState>(defaultForm('feedforward'))
   const [busy, setBusy] = useState(false)
+  /** Encoded "<pluginId>::<typeId>" when the Type dropdown points at a plugin
+   * type, otherwise null and the built-in form is used. */
+  const [selectedPluginType, setSelectedPluginType] = useState<string | null>(null)
+  const pluginTypes = pluginRegistry?.networkTypes ?? []
+  const activePluginType = selectedPluginType
+    ? pluginTypes.find(p => `${p.plugin.id}::${p.type.id}` === selectedPluginType) ?? null
+    : null
 
   useEffect(() => { void load() }, [])
 
@@ -178,28 +185,6 @@ export default function NetworksTab({ refreshNetworks, onSelect, pluginRegistry 
 
       {error && <div className="status error">{error}</div>}
 
-      {pluginRegistry && pluginRegistry.networkTypes.length > 0 && (
-        <div className="card">
-          <h3>Plugin network types</h3>
-          <p className="muted">
-            Types contributed by installed plugins. Each plugin manages its own
-            create form, corpus, and inference UI.
-          </p>
-          {pluginRegistry.networkTypes.map(({ plugin, type }) => (
-            <PluginTypeCard
-              key={`${plugin.id}:${type.id}`}
-              pluginName={plugin.name}
-              type={type}
-              context={pluginRegistry.context}
-              onCreated={async (id) => {
-                await refreshNetworks()
-                onSelect(id)
-              }}
-            />
-          ))}
-        </div>
-      )}
-
       <div className="card">
         <div className="card-row">
           <h3 style={{ margin: 0 }}>{showForm ? 'Create network' : `${list.length} network${list.length === 1 ? '' : 's'}`}</h3>
@@ -218,19 +203,48 @@ export default function NetworksTab({ refreshNetworks, onSelect, pluginRegistry 
               <div>
                 <label>Type</label>
                 <select
-                  value={form.kind}
+                  value={selectedPluginType ?? form.kind}
                   onChange={e => {
-                    const kind = e.target.value as NetworkKind
-                    setForm(defaultForm(kind))
+                    const v = e.target.value
+                    if (v.startsWith('plugin::')) {
+                      setSelectedPluginType(v.slice('plugin::'.length))
+                    } else {
+                      setSelectedPluginType(null)
+                      setForm(defaultForm(v as NetworkKind))
+                    }
                   }}
                 >
                   <option value="feedforward">Feed-forward (regression / classification)</option>
                   <option value="next_token">Next-token MLP (text on one-hot window)</option>
                   <option value="transformer">Transformer LM (llama-style — exports to GGUF for llama.cpp / LM Studio)</option>
+                  {pluginTypes.map(({ plugin, type }) => (
+                    <option key={`${plugin.id}::${type.id}`} value={`plugin::${plugin.id}::${type.id}`}>
+                      {type.label} (plugin: {plugin.name})
+                    </option>
+                  ))}
                 </select>
               </div>
             </div>
 
+            {activePluginType && (
+              <PluginErrorBoundary fallbackTitle={`${activePluginType.plugin.name} create form crashed`}>
+                <div>
+                  <p className="muted">{activePluginType.type.description}</p>
+                  <activePluginType.type.CreateForm
+                    context={pluginRegistry!.context}
+                    onCreated={async (id) => {
+                      setShowForm(false)
+                      setSelectedPluginType(null)
+                      await load()
+                      await refreshNetworks()
+                      onSelect(id)
+                    }}
+                  />
+                </div>
+              </PluginErrorBoundary>
+            )}
+
+            {!activePluginType && <>
             {form.kind === 'transformer' ? (
               <>
                 <div className="grid-3">
@@ -358,6 +372,7 @@ export default function NetworksTab({ refreshNetworks, onSelect, pluginRegistry 
               </button>
               <button className="secondary" onClick={() => setShowForm(false)}>Cancel</button>
             </div>
+            </>}
           </div>
         )}
       </div>
@@ -503,36 +518,5 @@ function ArchitecturePreview({ preview }: {
   )
 }
 
-// ─── Plugin type card (Networks tab) ─────────────────────────────────────────
-
-function PluginTypeCard({
-  pluginName, type, context, onCreated,
-}: {
-  pluginName: string
-  type: NetworkTypeDescriptor
-  context: PluginContext
-  onCreated: (id: string) => void
-}) {
-  const [open, setOpen] = useState(false)
-  const Form = type.CreateForm
-  return (
-    <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, marginTop: 12 }}>
-      <div className="card-row">
-        <div>
-          <strong>{type.label}</strong>{" "}
-          <span className="muted" style={{ fontSize: 12 }}>· {pluginName}</span>
-          <div className="muted" style={{ fontSize: 13 }}>{type.description}</div>
-        </div>
-        <button onClick={() => setOpen(o => !o)} className={open ? "secondary" : ""}>
-          {open ? "Cancel" : "New"}
-        </button>
-      </div>
-      {open && (
-        <div className="mt-2">
-          <Form context={context} onCreated={(id) => { setOpen(false); onCreated(id) }} />
-        </div>
-      )}
-    </div>
-  )
-}
+// PluginErrorBoundary used here is imported from the components folder.
 

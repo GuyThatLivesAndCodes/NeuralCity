@@ -3,6 +3,7 @@ import { type UnlistenFn } from '@tauri-apps/api/event'
 import { inference, vocabulary, corpus, Network, InferenceToken, CorpusStats } from '../api'
 import type { TabProps } from '../App'
 import NetworkViz from '../components/NetworkViz'
+import PluginErrorBoundary from '../components/PluginErrorBoundary'
 
 export default function InferenceTab({ network, pluginRegistry }: TabProps) {
   const [error, setError] = useState<string | null>(null)
@@ -18,7 +19,11 @@ export default function InferenceTab({ network, pluginRegistry }: TabProps) {
         <p className="muted">
           Managed by plugin <strong>{pluginType.plugin.name}</strong> · type <strong>{pluginType.type.label}</strong>.
         </p>
-        <PluginInference network={network} context={pluginRegistry!.context} />
+        <PluginErrorBoundary
+          key={`${pluginType.plugin.id}:${network.id}`}
+          fallbackTitle={`${pluginType.plugin.name} inference UI crashed`}>
+          <PluginInference network={network} context={pluginRegistry!.context} />
+        </PluginErrorBoundary>
       </div>
     )
   }

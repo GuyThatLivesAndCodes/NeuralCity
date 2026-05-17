@@ -4,6 +4,7 @@ import {
   CorpusStats, Stage, Network,
 } from '../api'
 import type { TabProps } from '../App'
+import PluginErrorBoundary from '../components/PluginErrorBoundary'
 
 export default function CorpusTab({ network, pluginRegistry }: TabProps) {
   const [stats, setStats] = useState<CorpusStats | null>(null)
@@ -25,7 +26,11 @@ export default function CorpusTab({ network, pluginRegistry }: TabProps) {
         <p className="muted">
           Managed by plugin <strong>{pluginType.plugin.name}</strong> · type <strong>{pluginType.type.label}</strong>.
         </p>
-        <PluginCorpus network={network} context={pluginRegistry!.context} />
+        <PluginErrorBoundary
+          key={`${pluginType.plugin.id}:${network.id}`}
+          fallbackTitle={`${pluginType.plugin.name} corpus UI crashed`}>
+          <PluginCorpus network={network} context={pluginRegistry!.context} />
+        </PluginErrorBoundary>
       </div>
     )
   }
