@@ -245,6 +245,15 @@ export default function TrainingTab({ network, refreshNetworks }: TabProps) {
   )
 }
 
+function formatDuration(secs: number): string {
+  if (secs < 60) return `${secs.toFixed(0)}s`
+  const m = Math.floor(secs / 60)
+  const s = Math.floor(secs % 60)
+  if (m < 60) return `${m}m ${s}s`
+  const h = Math.floor(m / 60)
+  return `${h}h ${m % 60}m`
+}
+
 function RunView({ run, trainingId, onReset, onError }: {
   run: RunState
   trainingId: string | null
@@ -266,23 +275,36 @@ function RunView({ run, trainingId, onReset, onError }: {
     catch (e) { onError(String(e)) }
   }
 
+  const epochsPerSec = run.epoch > 0 && run.elapsedSecs > 0
+    ? run.epoch / run.elapsedSecs
+    : null
+  const etaSecs = epochsPerSec && run.running && run.epoch < run.totalEpochs
+    ? (run.totalEpochs - run.epoch) / epochsPerSec
+    : null
+
   return (
     <>
       <div className={`status ${run.running ? '' : (run.finalStatus === 'aborted' ? 'error' : 'success')}`}>
         {run.running
           ? `Training… epoch ${run.epoch} / ${run.totalEpochs}`
           : run.finalStatus === 'aborted'
-            ? `Aborted — model rolled back to pre-training weights (${run.elapsedSecs.toFixed(1)}s)`
+            ? `Aborted — model rolled back to pre-training weights (${formatDuration(run.elapsedSecs)})`
             : run.finalStatus === 'cancelled'
-              ? `Stopped at epoch ${run.epoch} — kept current weights (${run.elapsedSecs.toFixed(1)}s)`
-              : `Done — ${run.totalEpochs} epochs in ${run.elapsedSecs.toFixed(1)}s`}
+              ? `Stopped at epoch ${run.epoch} — kept current weights (${formatDuration(run.elapsedSecs)})`
+              : `Done — ${run.totalEpochs} epochs in ${formatDuration(run.elapsedSecs)}`}
       </div>
 
       <div className="card">
-        <div className="grid-3">
+        <div className="grid-3" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
           <Metric label="Epoch" value={`${run.epoch} / ${run.totalEpochs}`} />
           <Metric label="Loss"  value={run.lastLoss.toFixed(6)} />
-          <Metric label="Time"  value={`${run.elapsedSecs.toFixed(1)}s`} />
+          <Metric label="Elapsed"  value={formatDuration(run.elapsedSecs)} />
+          <Metric
+            label={run.running ? 'ETA' : 'Speed'}
+            value={run.running
+              ? (etaSecs !== null ? formatDuration(etaSecs) : '—')
+              : (epochsPerSec !== null ? `${epochsPerSec.toFixed(1)} ep/s` : '—')}
+          />
         </div>
         <ProgressBar epoch={run.epoch} total={run.totalEpochs} />
 
@@ -359,31 +381,75 @@ function ProgressBar({ epoch, total }: { epoch: number; total: number }) {
 }
 
 function LossPlot({ history, color = 'var(--accent)' }: { history: number[]; color?: string }) {
+  const [logScale, setLogScale] = useState(false)
+
   if (history.length === 0) {
     return <p className="muted">Waiting for first epoch…</p>
   }
-  const max = Math.max(...history)
-  const min = Math.min(...history)
+
+  const allPositive = history.every(v => v > 0)
+  const useLog = logScale && allPositive
+
+  const transformed = useLog ? history.map(v => Math.log10(v)) : history
+  const max = Math.max(...transformed)
+  const min = Math.min(...transformed)
   const range = max - min || 1
 
-  // SVG viewBox in 100x100, paint grid + line
-  const points = history.map((v, i) => {
+  const toY = (v: number) => 100 - ((v - min) / range) * 90 - 5
+
+  const points = transformed.map((v, i) => {
     const x = (i / Math.max(history.length - 1, 1)) * 100
-    const y = 100 - ((v - min) / range) * 90 - 5
+    const y = toY(v)
     return `${x},${y}`
   }).join(' ')
 
+  // Best (minimum loss) epoch
+  const rawMin = Math.min(...history)
+  const bestIdx = history.indexOf(rawMin)
+  const bestX = (bestIdx / Math.max(history.length - 1, 1)) * 100
+  const bestY = toY(transformed[bestIdx])
+
+  // Grid lines: 3 evenly spaced between min and max
+  const gridLines = [25, 50, 75].map(pct => {
+    const v = min + (range * pct / 100)
+    return { y: toY(v), label: useLog ? `10^${v.toFixed(1)}` : v.toFixed(4) }
+  })
+
   return (
     <div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
+        <button
+          className={logScale ? '' : 'secondary'}
+          onClick={() => setLogScale(s => !s)}
+          style={{ fontSize: 11, padding: '3px 10px', textTransform: 'none', letterSpacing: 0 }}
+          title={allPositive ? 'Toggle log scale' : 'Log scale unavailable (loss values ≤ 0)'}
+          disabled={!allPositive}
+        >
+          log scale
+        </button>
+      </div>
       <svg viewBox="0 0 100 100" preserveAspectRatio="none"
            style={{ width: '100%', height: 220, background: 'var(--bg-input)', borderRadius: 4 }}>
-        {[25, 50, 75].map(y => (
-          <line key={y} x1="0" y1={y} x2="100" y2={y} stroke="var(--border-soft)" strokeWidth="0.2" />
+        {gridLines.map(({ y }, i) => (
+          <line key={i} x1="0" y1={y} x2="100" y2={y}
+                stroke="var(--border-soft)" strokeWidth="0.2" />
         ))}
-        <polyline points={points} fill="none" stroke={color} strokeWidth="1" vectorEffect="non-scaling-stroke" />
+        <polyline points={points} fill="none" stroke={color} strokeWidth="1"
+                  vectorEffect="non-scaling-stroke" />
+        {history.length > 1 && (
+          <>
+            <circle cx={bestX} cy={bestY} r="1.8" fill="var(--success)"
+                    vectorEffect="non-scaling-stroke" />
+            <line x1={bestX} y1={bestY} x2={bestX} y2="100"
+                  stroke="var(--success)" strokeWidth="0.3" strokeDasharray="1,1"
+                  vectorEffect="non-scaling-stroke" />
+          </>
+        )}
       </svg>
       <p className="muted small mt-1">
-        min {min.toFixed(6)} · max {max.toFixed(6)} · last {history[history.length - 1].toFixed(6)}
+        min {rawMin.toFixed(6)} @ epoch {bestIdx + 1}
+        {' · '}last {history[history.length - 1].toFixed(6)}
+        {useLog ? ' (log₁₀ scale)' : ''}
       </p>
     </div>
   )
@@ -487,7 +553,10 @@ function HistoryRunItem({ run, expanded, onToggle }: {
           loss {run.final_loss.toFixed(6)}
         </span>
         <span style={{ color: 'var(--text-faint)', fontSize: 12, marginLeft: 'auto' }}>
-          {run.elapsed_secs.toFixed(1)}s
+          {formatDuration(run.elapsed_secs)}
+          {run.elapsed_secs > 0 && run.epochs_run > 0
+            ? ` · ${(run.epochs_run / run.elapsed_secs).toFixed(1)} ep/s`
+            : ''}
         </span>
         <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>
           {expanded ? '▲' : '▼'}

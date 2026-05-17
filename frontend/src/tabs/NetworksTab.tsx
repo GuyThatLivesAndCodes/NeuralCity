@@ -384,7 +384,7 @@ export default function NetworksTab({ refreshNetworks, onSelect, pluginRegistry 
           <div className="flex-1">
             <strong>{n.name}</strong>
             <p>
-              <span className="chip">{n.kind === 'next_token' ? 'next-token' : 'feed-forward'}</span>
+              <span className="chip">{n.kind === 'next_token' ? 'next-token' : n.kind === 'transformer' ? 'transformer' : 'feed-forward'}</span>
               {' '}<span className="chip">{n.input_dim} → {n.output_dim}</span>
               {' '}<span className="chip">{n.layers.length} layers</span>
               {' '}<span className="chip">{n.parameter_count.toLocaleString()} params</span>
