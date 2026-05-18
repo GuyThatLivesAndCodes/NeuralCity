@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { type UnlistenFn } from '@tauri-apps/api/event'
 import {
   training, corpus, OptimizerConfig, CorpusStats, TrainingRun,
@@ -411,8 +411,31 @@ function ProgressBar({ epoch, total }: { epoch: number; total: number }) {
   )
 }
 
-function LossPlot({ history, color = 'var(--accent)' }: { history: number[]; color?: string }) {
+function emaSmooth(values: number[], alpha = 0.15): number[] {
+  if (values.length === 0) return []
+  const out = [values[0]]
+  for (let i = 1; i < values.length; i++)
+    out.push(alpha * values[i] + (1 - alpha) * out[i - 1])
+  return out
+}
+
+const COMPARE_PALETTE = [
+  'var(--accent)',
+  '#6b9fd4',
+  '#7da472',
+  '#c4a462',
+  '#a47dc4',
+  '#d47b7b',
+]
+
+function LossPlot({ history, color = 'var(--accent)', compact = false }: {
+  history: number[]
+  color?: string
+  compact?: boolean
+}) {
   const [logScale, setLogScale] = useState(false)
+  const [smoothing, setSmoothing] = useState(false)
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null)
 
   if (history.length === 0) {
     return <p className="muted">Waiting for first epoch…</p>
@@ -430,43 +453,78 @@ function LossPlot({ history, color = 'var(--accent)' }: { history: number[]; col
 
   const points = transformed.map((v, i) => {
     const x = (i / Math.max(history.length - 1, 1)) * 100
-    const y = toY(v)
-    return `${x},${y}`
+    return `${x},${toY(v)}`
   }).join(' ')
 
-  // Best (minimum loss) epoch
+  const smoothedPoints = smoothing
+    ? emaSmooth(transformed).map((v, i) => {
+        const x = (i / Math.max(history.length - 1, 1)) * 100
+        return `${x},${toY(v)}`
+      }).join(' ')
+    : null
+
   const rawMin = Math.min(...history)
   const bestIdx = history.indexOf(rawMin)
   const bestX = (bestIdx / Math.max(history.length - 1, 1)) * 100
   const bestY = toY(transformed[bestIdx])
 
-  // Grid lines: 3 evenly spaced between min and max
   const gridLines = [25, 50, 75].map(pct => {
     const v = min + (range * pct / 100)
-    return { y: toY(v), label: useLog ? `10^${v.toFixed(1)}` : v.toFixed(4) }
+    return { y: toY(v) }
   })
+
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+    setHoverIdx(Math.round(pct * (history.length - 1)))
+  }
+
+  const hoverX = hoverIdx !== null ? (hoverIdx / Math.max(history.length - 1, 1)) * 100 : null
+  const hoverLoss = hoverIdx !== null ? history[hoverIdx] : null
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
-        <button
-          className={logScale ? '' : 'secondary'}
-          onClick={() => setLogScale(s => !s)}
-          style={{ fontSize: 11, padding: '3px 10px', textTransform: 'none', letterSpacing: 0 }}
-          title={allPositive ? 'Toggle log scale' : 'Log scale unavailable (loss values ≤ 0)'}
-          disabled={!allPositive}
-        >
-          log scale
-        </button>
-      </div>
-      <svg viewBox="0 0 100 100" preserveAspectRatio="none"
-           style={{ width: '100%', height: 220, background: 'var(--bg-input)', borderRadius: 4 }}>
+      {!compact && (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, marginBottom: 6 }}>
+          <button
+            className={smoothing ? '' : 'secondary'}
+            onClick={() => setSmoothing(s => !s)}
+            style={{ fontSize: 11, padding: '3px 10px', textTransform: 'none', letterSpacing: 0 }}
+            title="Overlay an exponential moving average to reveal the trend through noisy loss curves"
+          >
+            smooth
+          </button>
+          <button
+            className={logScale ? '' : 'secondary'}
+            onClick={() => setLogScale(s => !s)}
+            style={{ fontSize: 11, padding: '3px 10px', textTransform: 'none', letterSpacing: 0 }}
+            title={allPositive ? 'Toggle log scale' : 'Log scale unavailable (loss values ≤ 0)'}
+            disabled={!allPositive}
+          >
+            log scale
+          </button>
+        </div>
+      )}
+      <svg
+        viewBox="0 0 100 100" preserveAspectRatio="none"
+        onMouseMove={handleMouseMove}
+        onMouseLeave={() => setHoverIdx(null)}
+        style={{
+          width: '100%', height: compact ? 160 : 220,
+          background: 'var(--bg-input)', borderRadius: 4,
+          cursor: 'crosshair', display: 'block',
+        }}
+      >
         {gridLines.map(({ y }, i) => (
           <line key={i} x1="0" y1={y} x2="100" y2={y}
                 stroke="var(--border-soft)" strokeWidth="0.2" />
         ))}
         <polyline points={points} fill="none" stroke={color} strokeWidth="1"
-                  vectorEffect="non-scaling-stroke" />
+                  vectorEffect="non-scaling-stroke" opacity={smoothing ? 0.3 : 1} />
+        {smoothedPoints && (
+          <polyline points={smoothedPoints} fill="none" stroke={color} strokeWidth="1.5"
+                    vectorEffect="non-scaling-stroke" />
+        )}
         {history.length > 1 && (
           <>
             <circle cx={bestX} cy={bestY} r="1.8" fill="var(--success)"
@@ -476,12 +534,71 @@ function LossPlot({ history, color = 'var(--accent)' }: { history: number[]; col
                   vectorEffect="non-scaling-stroke" />
           </>
         )}
+        {hoverX !== null && hoverIdx !== null && (
+          <>
+            <line x1={hoverX} y1="0" x2={hoverX} y2="100"
+                  stroke="var(--text-muted)" strokeWidth="0.4" strokeDasharray="1.5,1.5"
+                  vectorEffect="non-scaling-stroke" />
+            <circle cx={hoverX} cy={toY(transformed[hoverIdx])} r="2.2"
+                    fill={color} stroke="var(--bg-input)" strokeWidth="1"
+                    vectorEffect="non-scaling-stroke" />
+          </>
+        )}
       </svg>
       <p className="muted small mt-1">
-        min {rawMin.toFixed(6)} @ epoch {bestIdx + 1}
-        {' · '}last {history[history.length - 1].toFixed(6)}
-        {useLog ? ' (log₁₀ scale)' : ''}
+        {hoverLoss !== null && hoverIdx !== null
+          ? <>epoch {hoverIdx + 1} · loss {hoverLoss.toFixed(6)}{useLog ? ' (log₁₀)' : ''}</>
+          : <>min {rawMin.toFixed(6)} @ epoch {bestIdx + 1}{' · '}last {history[history.length - 1].toFixed(6)}{useLog ? ' (log₁₀ scale)' : ''}</>
+        }
       </p>
+    </div>
+  )
+}
+
+function MultiLossPlot({ series }: {
+  series: { history: number[]; label: string }[]
+}) {
+  if (series.length === 0) return null
+
+  const allValues = series.flatMap(s => s.history)
+  const globalMax = Math.max(...allValues)
+  const globalMin = Math.min(...allValues)
+  const range = globalMax - globalMin || 1
+  const toY = (v: number) => 100 - ((v - globalMin) / range) * 90 - 5
+
+  const gridLines = [25, 50, 75].map(pct => toY(globalMin + range * pct / 100))
+
+  return (
+    <div>
+      <svg viewBox="0 0 100 100" preserveAspectRatio="none"
+           style={{ width: '100%', height: 200, background: 'var(--bg-input)', borderRadius: 4, display: 'block' }}>
+        {gridLines.map((y, i) => (
+          <line key={i} x1="0" y1={y} x2="100" y2={y}
+                stroke="var(--border-soft)" strokeWidth="0.2" />
+        ))}
+        {series.map((s, si) => {
+          const pts = s.history.map((v, i) => {
+            const x = (i / Math.max(s.history.length - 1, 1)) * 100
+            return `${x},${toY(v)}`
+          }).join(' ')
+          return (
+            <polyline key={si} points={pts} fill="none"
+                      stroke={COMPARE_PALETTE[si % COMPARE_PALETTE.length]}
+                      strokeWidth="1" vectorEffect="non-scaling-stroke" />
+          )
+        })}
+      </svg>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 14px', marginTop: 8 }}>
+        {series.map((s, si) => (
+          <span key={si} style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 5 }}>
+            <span style={{
+              display: 'inline-block', width: 18, height: 2, borderRadius: 1,
+              background: COMPARE_PALETTE[si % COMPARE_PALETTE.length],
+            }} />
+            <span style={{ color: 'var(--text-muted)' }}>{s.label}</span>
+          </span>
+        ))}
+      </div>
     </div>
   )
 }
@@ -492,6 +609,7 @@ function HistoryPanel({ networkId, refreshKey }: { networkId: string; refreshKey
   const [runs, setRuns] = useState<TrainingRun[]>([])
   const [expanded, setExpanded] = useState<string | null>(null)
   const [clearing, setClearing] = useState(false)
+  const [comparing, setComparing] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     training.history(networkId).then(setRuns).catch(() => setRuns([]))
@@ -505,26 +623,73 @@ function HistoryPanel({ networkId, refreshKey }: { networkId: string; refreshKey
       await training.clearHistory(networkId)
       setRuns([])
       setExpanded(null)
+      setComparing(new Set())
     } finally {
       setClearing(false)
     }
   }
 
+  const toggleCompare = (id: string) =>
+    setComparing(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+
+  const comparedRuns = runs.filter(r => comparing.has(r.id) && r.loss_history.length > 0)
+
   return (
     <div className="card">
       <div className="card-row" style={{ marginBottom: 12 }}>
         <h3 style={{ marginBottom: 0 }}>Training History</h3>
-        <button className="ghost" style={{ fontSize: 12, padding: '4px 10px' }}
-          onClick={clearAll} disabled={clearing}>
-          {clearing ? 'Clearing…' : 'Clear all'}
-        </button>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {comparing.size > 0 && (
+            <button className="ghost" style={{ fontSize: 12, padding: '4px 10px' }}
+              onClick={() => setComparing(new Set())}>
+              Clear selection
+            </button>
+          )}
+          <button className="ghost" style={{ fontSize: 12, padding: '4px 10px' }}
+            onClick={clearAll} disabled={clearing}>
+            {clearing ? 'Clearing…' : 'Clear all'}
+          </button>
+        </div>
       </div>
+
+      {comparedRuns.length >= 2 && (
+        <div style={{ marginBottom: 12, padding: 12, border: '1px solid var(--border-soft)',
+                      borderRadius: 'var(--radius)', background: 'var(--bg-elev-2)' }}>
+          <h4 style={{ margin: '0 0 10px' }}>Comparing {comparedRuns.length} runs</h4>
+          <MultiLossPlot
+            series={comparedRuns.map((r) => {
+              const timeStr = new Date(r.started_at).toLocaleTimeString(
+                undefined, { hour: '2-digit', minute: '2-digit' })
+              return {
+                history: r.loss_history,
+                label: `${timeStr} · ${r.config_summary.optimizer} lr=${r.config_summary.lr} · final ${r.final_loss.toFixed(4)}`,
+              }
+            })}
+          />
+          <p className="muted small" style={{ marginTop: 8 }}>
+            X axis: percentage of training completed. Select runs below using the + button.
+          </p>
+        </div>
+      )}
+
+      {comparedRuns.length === 1 && (
+        <p className="muted small" style={{ marginBottom: 10 }}>
+          Select one more run to compare.
+        </p>
+      )}
+
       {runs.map(run => (
         <HistoryRunItem
           key={run.id}
           run={run}
           expanded={expanded === run.id}
           onToggle={() => setExpanded(prev => prev === run.id ? null : run.id)}
+          compareSelected={comparing.has(run.id)}
+          onToggleCompare={run.loss_history.length > 0 ? () => toggleCompare(run.id) : undefined}
         />
       ))}
     </div>
@@ -538,10 +703,12 @@ const STATUS_COLORS: Record<string, string> = {
   error:      'var(--error)',
 }
 
-function HistoryRunItem({ run, expanded, onToggle }: {
+function HistoryRunItem({ run, expanded, onToggle, compareSelected, onToggleCompare }: {
   run: TrainingRun
   expanded: boolean
   onToggle: () => void
+  compareSelected?: boolean
+  onToggleCompare?: () => void
 }) {
   const date = new Date(run.started_at)
   const dateStr = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
@@ -551,53 +718,75 @@ function HistoryRunItem({ run, expanded, onToggle }: {
 
   return (
     <div style={{ marginBottom: 6 }}>
-      <button
-        onClick={onToggle}
-        style={{
-          display: 'flex', alignItems: 'center', gap: 10,
-          width: '100%', textAlign: 'left',
-          background: expanded ? 'var(--bg-elev-2)' : 'transparent',
-          border: '1px solid var(--border-soft)',
-          borderRadius: 'var(--radius)',
-          padding: '8px 12px',
-          cursor: 'pointer',
-          color: 'var(--text)',
-          fontFamily: 'var(--font-sans)',
-          fontSize: 13,
-          transition: 'background 0.12s ease',
-        }}
-      >
-        <span style={{ color: statusColor, fontSize: 11, fontWeight: 600,
-                        textTransform: 'uppercase', letterSpacing: '0.06em', minWidth: 64 }}>
-          {run.status}
-        </span>
-        <span style={{ color: 'var(--text-muted)', fontSize: 12, minWidth: 90 }}>
-          {dateStr} {timeStr}
-        </span>
-        <span className="chip" style={{ fontSize: 11 }}>
-          {run.config_summary.optimizer} lr={run.config_summary.lr}
-        </span>
-        <span className="chip" style={{ fontSize: 11 }}>
-          {run.epochs_run}/{run.total_epochs} epochs
-        </span>
-        <span className="chip" style={{ fontSize: 11 }}>
-          loss {run.final_loss.toFixed(6)}
-        </span>
-        <span style={{ color: 'var(--text-faint)', fontSize: 12, marginLeft: 'auto' }}>
-          {formatDuration(run.elapsed_secs)}
-          {run.elapsed_secs > 0 && run.epochs_run > 0
-            ? ` · ${(run.epochs_run / run.elapsed_secs).toFixed(1)} ep/s`
-            : ''}
-        </span>
-        <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>
-          {expanded ? '▲' : '▼'}
-        </span>
-      </button>
+      <div style={{ display: 'flex', gap: 4, alignItems: 'stretch' }}>
+        {onToggleCompare && (
+          <button
+            onClick={onToggleCompare}
+            title={compareSelected ? 'Remove from comparison' : 'Add to comparison chart'}
+            style={{
+              flexShrink: 0, width: 30,
+              background: compareSelected ? 'var(--accent-bg)' : 'transparent',
+              border: `1px solid ${compareSelected ? 'var(--accent)' : 'var(--border-soft)'}`,
+              borderRadius: 'var(--radius)',
+              cursor: 'pointer',
+              color: compareSelected ? 'var(--accent)' : 'var(--text-faint)',
+              fontSize: 15, fontWeight: 600,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              transition: 'background 0.12s, border-color 0.12s, color 0.12s',
+            }}
+          >
+            {compareSelected ? '✓' : '+'}
+          </button>
+        )}
+        <button
+          onClick={onToggle}
+          style={{
+            flex: 1,
+            display: 'flex', alignItems: 'center', gap: 10,
+            textAlign: 'left',
+            background: expanded ? 'var(--bg-elev-2)' : 'transparent',
+            border: '1px solid var(--border-soft)',
+            borderRadius: 'var(--radius)',
+            padding: '8px 12px',
+            cursor: 'pointer',
+            color: 'var(--text)',
+            fontFamily: 'var(--font-sans)',
+            fontSize: 13,
+            transition: 'background 0.12s ease',
+          }}
+        >
+          <span style={{ color: statusColor, fontSize: 11, fontWeight: 600,
+                          textTransform: 'uppercase', letterSpacing: '0.06em', minWidth: 64 }}>
+            {run.status}
+          </span>
+          <span style={{ color: 'var(--text-muted)', fontSize: 12, minWidth: 90 }}>
+            {dateStr} {timeStr}
+          </span>
+          <span className="chip" style={{ fontSize: 11 }}>
+            {run.config_summary.optimizer} lr={run.config_summary.lr}
+          </span>
+          <span className="chip" style={{ fontSize: 11 }}>
+            {run.epochs_run}/{run.total_epochs} epochs
+          </span>
+          <span className="chip" style={{ fontSize: 11 }}>
+            loss {run.final_loss.toFixed(6)}
+          </span>
+          <span style={{ color: 'var(--text-faint)', fontSize: 12, marginLeft: 'auto' }}>
+            {formatDuration(run.elapsed_secs)}
+            {run.elapsed_secs > 0 && run.epochs_run > 0
+              ? ` · ${(run.epochs_run / run.elapsed_secs).toFixed(1)} ep/s`
+              : ''}
+          </span>
+          <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+            {expanded ? '▲' : '▼'}
+          </span>
+        </button>
+      </div>
       {expanded && run.loss_history.length > 0 && (
         <div style={{ padding: '12px 12px 4px', background: 'var(--bg-elev-2)',
                       border: '1px solid var(--border-soft)', borderTop: 'none',
                       borderRadius: '0 0 var(--radius) var(--radius)' }}>
-          <LossPlot history={run.loss_history} color={plotColor} />
+          <LossPlot history={run.loss_history} color={plotColor} compact />
         </div>
       )}
     </div>
