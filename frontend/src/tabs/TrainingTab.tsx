@@ -413,6 +413,8 @@ function ProgressBar({ epoch, total }: { epoch: number; total: number }) {
 
 function LossPlot({ history, color = 'var(--accent)' }: { history: number[]; color?: string }) {
   const [logScale, setLogScale] = useState(false)
+  const [smoothing, setSmoothing] = useState(0)
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null)
 
   if (history.length === 0) {
     return <p className="muted">Waiting for first epoch…</p>
@@ -420,35 +422,67 @@ function LossPlot({ history, color = 'var(--accent)' }: { history: number[]; col
 
   const allPositive = history.every(v => v > 0)
   const useLog = logScale && allPositive
+  const transform = (v: number) => useLog ? Math.log10(Math.max(v, 1e-10)) : v
 
-  const transformed = useLog ? history.map(v => Math.log10(v)) : history
-  const max = Math.max(...transformed)
-  const min = Math.min(...transformed)
-  const range = max - min || 1
+  // EMA smoothing — same formula as TensorBoard
+  const smoothed: number[] = []
+  if (smoothing > 0) {
+    let ema = history[0]
+    for (const v of history) {
+      ema = smoothing * ema + (1 - smoothing) * v
+      smoothed.push(ema)
+    }
+  }
 
-  const toY = (v: number) => 100 - ((v - min) / range) * 90 - 5
+  const allForScale = [...history.map(transform), ...smoothed.map(transform)]
+  const yMax = Math.max(...allForScale)
+  const yMin = Math.min(...allForScale)
+  const yRange = yMax - yMin || 1
 
-  const points = transformed.map((v, i) => {
-    const x = (i / Math.max(history.length - 1, 1)) * 100
-    const y = toY(v)
-    return `${x},${y}`
-  }).join(' ')
+  const toY = (v: number) => 100 - ((transform(v) - yMin) / yRange) * 85 - 8
+  const toX = (i: number) => (i / Math.max(history.length - 1, 1)) * 92 + 8
 
-  // Best (minimum loss) epoch
+  const rawPoints  = history.map((v, i) => `${toX(i)},${toY(v)}`).join(' ')
+  const smthPoints = smoothed.map((v, i) => `${toX(i)},${toY(v)}`).join(' ')
+  const displayPoints = smoothing > 0 ? smthPoints : rawPoints
+
   const rawMin = Math.min(...history)
   const bestIdx = history.indexOf(rawMin)
-  const bestX = (bestIdx / Math.max(history.length - 1, 1)) * 100
-  const bestY = toY(transformed[bestIdx])
 
-  // Grid lines: 3 evenly spaced between min and max
-  const gridLines = [25, 50, 75].map(pct => {
-    const v = min + (range * pct / 100)
-    return { y: toY(v), label: useLog ? `10^${v.toFixed(1)}` : v.toFixed(4) }
+  const yGridVals = [0.2, 0.4, 0.6, 0.8].map(t => {
+    const rawV = yMin + yRange * t
+    const displayV = useLog ? Math.pow(10, rawV) : rawV
+    return {
+      y: 100 - t * 85 - 8,
+      label: Math.abs(displayV) < 0.001 ? displayV.toExponential(2) : displayV.toFixed(4),
+    }
   })
+
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (history.length <= 1) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    const svgX = ((e.clientX - rect.left) / rect.width) * 100
+    const frac = Math.max(0, Math.min(1, (svgX - 8) / 92))
+    setHoverIdx(Math.round(frac * (history.length - 1)))
+  }
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+            Smooth
+          </span>
+          <input
+            type="range" min={0} max={0.99} step={0.01} value={smoothing}
+            onChange={e => setSmoothing(parseFloat(e.target.value))}
+            style={{ width: 72, padding: 0, cursor: 'pointer', border: 'none', background: 'transparent' }}
+            title="EMA smoothing factor (0 = raw, 0.99 = very smooth)"
+          />
+          <span style={{ fontSize: 11, color: 'var(--text-faint)', minWidth: 28, fontVariantNumeric: 'tabular-nums' }}>
+            {smoothing.toFixed(2)}
+          </span>
+        </div>
         <button
           className={logScale ? '' : 'secondary'}
           onClick={() => setLogScale(s => !s)}
@@ -459,29 +493,170 @@ function LossPlot({ history, color = 'var(--accent)' }: { history: number[]; col
           log scale
         </button>
       </div>
-      <svg viewBox="0 0 100 100" preserveAspectRatio="none"
-           style={{ width: '100%', height: 220, background: 'var(--bg-input)', borderRadius: 4 }}>
-        {gridLines.map(({ y }, i) => (
-          <line key={i} x1="0" y1={y} x2="100" y2={y}
-                stroke="var(--border-soft)" strokeWidth="0.2" />
-        ))}
-        <polyline points={points} fill="none" stroke={color} strokeWidth="1"
-                  vectorEffect="non-scaling-stroke" />
-        {history.length > 1 && (
-          <>
-            <circle cx={bestX} cy={bestY} r="1.8" fill="var(--success)"
+
+      <div style={{ position: 'relative' }}>
+        <svg
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          style={{ width: '100%', height: 220, background: 'var(--bg-input)', borderRadius: 4, display: 'block' }}
+          onMouseMove={handleMouseMove}
+          onMouseLeave={() => setHoverIdx(null)}
+        >
+          {yGridVals.map(({ y, label }, i) => (
+            <g key={i}>
+              <line x1="8" y1={y} x2="100" y2={y} stroke="var(--border-soft)" strokeWidth="0.2" />
+              <text x="7" y={y} fontSize="3.5" fill="var(--text-faint)"
+                    textAnchor="end" dominantBaseline="middle">
+                {label}
+              </text>
+            </g>
+          ))}
+          {smoothing > 0 && (
+            <polyline points={rawPoints} fill="none" stroke={color} strokeWidth="0.7"
+                      vectorEffect="non-scaling-stroke" opacity={0.25} />
+          )}
+          <polyline points={displayPoints} fill="none" stroke={color} strokeWidth="1"
                     vectorEffect="non-scaling-stroke" />
-            <line x1={bestX} y1={bestY} x2={bestX} y2="100"
-                  stroke="var(--success)" strokeWidth="0.3" strokeDasharray="1,1"
-                  vectorEffect="non-scaling-stroke" />
-          </>
+          {history.length > 1 && (
+            <>
+              <circle cx={toX(bestIdx)} cy={toY(rawMin)} r="1.8" fill="var(--success)"
+                      vectorEffect="non-scaling-stroke" />
+              <line x1={toX(bestIdx)} y1={toY(rawMin)} x2={toX(bestIdx)} y2="100"
+                    stroke="var(--success)" strokeWidth="0.3" strokeDasharray="1,1"
+                    vectorEffect="non-scaling-stroke" />
+            </>
+          )}
+          {hoverIdx !== null && (
+            <>
+              <line x1={toX(hoverIdx)} y1="5" x2={toX(hoverIdx)} y2="100"
+                    stroke="var(--text-faint)" strokeWidth="0.4" strokeDasharray="1.5,1.5"
+                    vectorEffect="non-scaling-stroke" />
+              <circle cx={toX(hoverIdx)} cy={toY(history[hoverIdx])} r="1.6" fill={color}
+                      vectorEffect="non-scaling-stroke" />
+            </>
+          )}
+        </svg>
+
+        {hoverIdx !== null && (
+          <div style={{
+            position: 'absolute', top: 6, right: 6,
+            background: 'var(--bg-elev-2)', border: '1px solid var(--border)',
+            borderRadius: 'var(--radius-sm)', padding: '4px 8px',
+            fontSize: 11, fontVariantNumeric: 'tabular-nums',
+            color: 'var(--text)', pointerEvents: 'none', lineHeight: 1.7,
+          }}>
+            <span style={{ color: 'var(--text-muted)' }}>epoch </span>
+            <strong>{hoverIdx + 1}</strong>
+            {'  '}
+            <span style={{ color: 'var(--text-muted)' }}>loss </span>
+            <strong>{history[hoverIdx].toFixed(6)}</strong>
+            {smoothing > 0 && smoothed[hoverIdx] !== undefined && (
+              <>
+                <br />
+                <span style={{ color: 'var(--text-muted)' }}>smooth </span>
+                <strong>{smoothed[hoverIdx].toFixed(6)}</strong>
+              </>
+            )}
+          </div>
         )}
-      </svg>
+      </div>
+
       <p className="muted small mt-1">
         min {rawMin.toFixed(6)} @ epoch {bestIdx + 1}
         {' · '}last {history[history.length - 1].toFixed(6)}
         {useLog ? ' (log₁₀ scale)' : ''}
+        {smoothing > 0 ? ` · smoothing ${smoothing.toFixed(2)}` : ''}
       </p>
+    </div>
+  )
+}
+
+// ─── Run comparison ──────────────────────────────────────────────────────────
+
+const COMPARE_COLORS = ['#d97757', '#6ba3d6', '#7da472', '#c4a44e', '#c47aba']
+
+function RunComparePlot({ runs }: { runs: TrainingRun[] }) {
+  const [logScale, setLogScale] = useState(false)
+
+  const allHistories = runs.map(r => r.loss_history).filter(h => h.length > 1)
+  if (allHistories.length < 2) return null
+
+  const allVals = allHistories.flat()
+  const allPositive = allVals.every(v => v > 0)
+  const useLog = logScale && allPositive
+  const transform = (v: number) => useLog ? Math.log10(Math.max(v, 1e-10)) : v
+
+  const allTransformed = allVals.map(transform)
+  const yMax = Math.max(...allTransformed)
+  const yMin = Math.min(...allTransformed)
+  const yRange = yMax - yMin || 1
+
+  const toY = (v: number) => 100 - ((transform(v) - yMin) / yRange) * 85 - 8
+  const toX = (i: number, total: number) => (i / Math.max(total - 1, 1)) * 92 + 8
+
+  const yGridVals = [0.25, 0.5, 0.75].map(t => {
+    const rawV = yMin + yRange * t
+    const displayV = useLog ? Math.pow(10, rawV) : rawV
+    return {
+      y: 100 - t * 85 - 8,
+      label: Math.abs(displayV) < 0.001 ? displayV.toExponential(2) : displayV.toFixed(4),
+    }
+  })
+
+  return (
+    <div style={{ marginTop: 14, paddingTop: 14, borderTop: '1px solid var(--border-soft)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <h4 style={{ margin: 0 }}>Comparison</h4>
+        <button
+          className={logScale ? '' : 'secondary'}
+          onClick={() => setLogScale(s => !s)}
+          style={{ fontSize: 11, padding: '3px 10px', textTransform: 'none', letterSpacing: 0 }}
+          disabled={!allPositive}
+        >
+          log scale
+        </button>
+      </div>
+      <svg
+        viewBox="0 0 100 100"
+        preserveAspectRatio="none"
+        style={{ width: '100%', height: 160, background: 'var(--bg-input)', borderRadius: 4, display: 'block' }}
+      >
+        {yGridVals.map(({ y, label }, i) => (
+          <g key={i}>
+            <line x1="8" y1={y} x2="100" y2={y} stroke="var(--border-soft)" strokeWidth="0.2" />
+            <text x="7" y={y} fontSize="3.5" fill="var(--text-faint)"
+                  textAnchor="end" dominantBaseline="middle">
+              {label}
+            </text>
+          </g>
+        ))}
+        {runs.map((run, ri) => {
+          const h = run.loss_history
+          if (h.length < 2) return null
+          const pts = h.map((v, i) => `${toX(i, h.length)},${toY(v)}`).join(' ')
+          return (
+            <polyline key={run.id} points={pts} fill="none"
+                      stroke={COMPARE_COLORS[ri % COMPARE_COLORS.length]}
+                      strokeWidth="0.9" vectorEffect="non-scaling-stroke" />
+          )
+        })}
+      </svg>
+      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', marginTop: 6 }}>
+        {runs.map((run, ri) => (
+          <span key={run.id} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+            <span style={{
+              display: 'inline-block', width: 18, height: 2,
+              background: COMPARE_COLORS[ri % COMPARE_COLORS.length], borderRadius: 1,
+            }} />
+            <span style={{ color: 'var(--text-muted)' }}>
+              {run.config_summary.optimizer} lr={run.config_summary.lr}
+            </span>
+            <span style={{ color: 'var(--text-faint)' }}>
+              {run.final_loss.toFixed(5)}
+            </span>
+          </span>
+        ))}
+      </div>
     </div>
   )
 }
@@ -491,10 +666,12 @@ function LossPlot({ history, color = 'var(--accent)' }: { history: number[]; col
 function HistoryPanel({ networkId, refreshKey }: { networkId: string; refreshKey: number }) {
   const [runs, setRuns] = useState<TrainingRun[]>([])
   const [expanded, setExpanded] = useState<string | null>(null)
+  const [comparing, setComparing] = useState<Set<string>>(new Set())
   const [clearing, setClearing] = useState(false)
 
   useEffect(() => {
     training.history(networkId).then(setRuns).catch(() => setRuns([]))
+    setComparing(new Set())
   }, [networkId, refreshKey])
 
   if (runs.length === 0) return null
@@ -505,10 +682,19 @@ function HistoryPanel({ networkId, refreshKey }: { networkId: string; refreshKey
       await training.clearHistory(networkId)
       setRuns([])
       setExpanded(null)
+      setComparing(new Set())
     } finally {
       setClearing(false)
     }
   }
+
+  const toggleCompare = (id: string) => setComparing(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
+
+  const compareRuns = runs.filter(r => comparing.has(r.id))
 
   return (
     <div className="card">
@@ -525,8 +711,16 @@ function HistoryPanel({ networkId, refreshKey }: { networkId: string; refreshKey
           run={run}
           expanded={expanded === run.id}
           onToggle={() => setExpanded(prev => prev === run.id ? null : run.id)}
+          inCompare={comparing.has(run.id)}
+          onToggleCompare={() => toggleCompare(run.id)}
         />
       ))}
+      {compareRuns.length >= 2 && <RunComparePlot runs={compareRuns} />}
+      {runs.length >= 2 && comparing.size < 2 && (
+        <p className="muted small" style={{ marginTop: 8, textAlign: 'center' }}>
+          Click ≈ on two or more runs to compare their loss curves.
+        </p>
+      )}
     </div>
   )
 }
@@ -538,10 +732,12 @@ const STATUS_COLORS: Record<string, string> = {
   error:      'var(--error)',
 }
 
-function HistoryRunItem({ run, expanded, onToggle }: {
+function HistoryRunItem({ run, expanded, onToggle, inCompare, onToggleCompare }: {
   run: TrainingRun
   expanded: boolean
   onToggle: () => void
+  inCompare: boolean
+  onToggleCompare: () => void
 }) {
   const date = new Date(run.started_at)
   const dateStr = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
@@ -551,48 +747,59 @@ function HistoryRunItem({ run, expanded, onToggle }: {
 
   return (
     <div style={{ marginBottom: 6 }}>
-      <button
-        onClick={onToggle}
-        style={{
-          display: 'flex', alignItems: 'center', gap: 10,
-          width: '100%', textAlign: 'left',
-          background: expanded ? 'var(--bg-elev-2)' : 'transparent',
-          border: '1px solid var(--border-soft)',
-          borderRadius: 'var(--radius)',
-          padding: '8px 12px',
-          cursor: 'pointer',
-          color: 'var(--text)',
-          fontFamily: 'var(--font-sans)',
-          fontSize: 13,
-          transition: 'background 0.12s ease',
-        }}
-      >
-        <span style={{ color: statusColor, fontSize: 11, fontWeight: 600,
-                        textTransform: 'uppercase', letterSpacing: '0.06em', minWidth: 64 }}>
-          {run.status}
-        </span>
-        <span style={{ color: 'var(--text-muted)', fontSize: 12, minWidth: 90 }}>
-          {dateStr} {timeStr}
-        </span>
-        <span className="chip" style={{ fontSize: 11 }}>
-          {run.config_summary.optimizer} lr={run.config_summary.lr}
-        </span>
-        <span className="chip" style={{ fontSize: 11 }}>
-          {run.epochs_run}/{run.total_epochs} epochs
-        </span>
-        <span className="chip" style={{ fontSize: 11 }}>
-          loss {run.final_loss.toFixed(6)}
-        </span>
-        <span style={{ color: 'var(--text-faint)', fontSize: 12, marginLeft: 'auto' }}>
-          {formatDuration(run.elapsed_secs)}
-          {run.elapsed_secs > 0 && run.epochs_run > 0
-            ? ` · ${(run.epochs_run / run.elapsed_secs).toFixed(1)} ep/s`
-            : ''}
-        </span>
-        <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>
-          {expanded ? '▲' : '▼'}
-        </span>
-      </button>
+      <div style={{ display: 'flex', gap: 4 }}>
+        <button
+          onClick={onToggle}
+          style={{
+            flex: 1,
+            display: 'flex', alignItems: 'center', gap: 10,
+            textAlign: 'left',
+            background: expanded ? 'var(--bg-elev-2)' : 'transparent',
+            border: '1px solid var(--border-soft)',
+            borderRadius: 'var(--radius)',
+            padding: '8px 12px',
+            cursor: 'pointer',
+            color: 'var(--text)',
+            fontFamily: 'var(--font-sans)',
+            fontSize: 13,
+            transition: 'background 0.12s ease',
+          }}
+        >
+          <span style={{ color: statusColor, fontSize: 11, fontWeight: 600,
+                          textTransform: 'uppercase', letterSpacing: '0.06em', minWidth: 64 }}>
+            {run.status}
+          </span>
+          <span style={{ color: 'var(--text-muted)', fontSize: 12, minWidth: 90 }}>
+            {dateStr} {timeStr}
+          </span>
+          <span className="chip" style={{ fontSize: 11 }}>
+            {run.config_summary.optimizer} lr={run.config_summary.lr}
+          </span>
+          <span className="chip" style={{ fontSize: 11 }}>
+            {run.epochs_run}/{run.total_epochs} epochs
+          </span>
+          <span className="chip" style={{ fontSize: 11 }}>
+            loss {run.final_loss.toFixed(6)}
+          </span>
+          <span style={{ color: 'var(--text-faint)', fontSize: 12, marginLeft: 'auto' }}>
+            {formatDuration(run.elapsed_secs)}
+            {run.elapsed_secs > 0 && run.epochs_run > 0
+              ? ` · ${(run.epochs_run / run.elapsed_secs).toFixed(1)} ep/s`
+              : ''}
+          </span>
+          <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>
+            {expanded ? '▲' : '▼'}
+          </span>
+        </button>
+        <button
+          onClick={onToggleCompare}
+          className={inCompare ? '' : 'secondary'}
+          title={inCompare ? 'Remove from comparison' : 'Add to comparison'}
+          style={{ fontSize: 14, padding: '0 12px', flexShrink: 0 }}
+        >
+          ≈
+        </button>
+      </div>
       {expanded && run.loss_history.length > 0 && (
         <div style={{ padding: '12px 12px 4px', background: 'var(--bg-elev-2)',
                       border: '1px solid var(--border-soft)', borderTop: 'none',
