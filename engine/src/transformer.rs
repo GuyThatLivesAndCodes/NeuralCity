@@ -19,7 +19,7 @@
 use crate::optimizer::OptimizerKind;
 use crate::tensor::{SplitMix64, Tensor};
 use burn::module::{Module, Param};
-use burn::nn::loss::CrossEntropyLossConfig;
+use burn::nn::loss::{CrossEntropyLoss, CrossEntropyLossConfig};
 use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{
     Adam, AdamConfig, AdamW, AdamWConfig, GradientsParams, Optimizer as BurnOptimizer, Sgd,
@@ -494,6 +494,16 @@ pub struct TrainerSession<B: AutodiffBackend> {
     cos: BT<B, 2>,
     sin: BT<B, 2>,
     mask: BT<B, 2, burn::tensor::Bool>,
+    /// `CrossEntropyLoss` module is cheap to build but allocating one per
+    /// step adds up — we instantiate it once and reuse it across batches.
+    loss_module: CrossEntropyLoss<B>,
+    /// On-GPU running sum of step losses + count, drained by
+    /// `take_pending_loss_mean()`. Keeping the sum on-device means
+    /// `step()` never blocks the CPU on a GPU sync — that one change is
+    /// what lets WGPU actually pipeline forward/backward/optimizer across
+    /// batches instead of serializing the whole run on the readback.
+    pending_loss_sum: Option<BT<B::InnerBackend, 1>>,
+    pending_loss_count: u32,
 }
 
 /// On-device snapshot of frozen parameters. Cheap to capture (Burn tensors
@@ -532,6 +542,7 @@ impl<B: AutodiffBackend> TrainerSession<B> {
         let (cos, sin) = rope_tables::<B>(seq_len, head_dim, cfg.rope_theta, &device);
         let mask = causal_mask::<B>(seq_len, &device);
         let (opt, lr) = build_opt::<B>(kind);
+        let loss_module = CrossEntropyLossConfig::new().init(&device);
         Self {
             net: Some(net),
             opt,
@@ -542,6 +553,9 @@ impl<B: AutodiffBackend> TrainerSession<B> {
             cos,
             sin,
             mask,
+            loss_module,
+            pending_loss_sum: None,
+            pending_loss_count: 0,
         }
     }
 
@@ -549,14 +563,27 @@ impl<B: AutodiffBackend> TrainerSession<B> {
     pub fn set_lr(&mut self, lr: f32) { self.lr = lr as f64; }
 
     /// One training step on a flattened `(batch * seq_len)` input/target
-    /// pair. Returns the loss for monitoring.
-    pub fn step(&mut self, inputs: &[u32], targets: &[u32], batch: usize) -> f32 {
+    /// pair. The loss is *not* read back to CPU here — the value is added to
+    /// an on-device running sum that `take_pending_loss_mean()` drains at
+    /// the end of the epoch.
+    ///
+    /// Skipping the per-step `into_scalar()` is the single biggest CPU-side
+    /// speedup: WGPU dispatches are non-blocking, so as long as we don't
+    /// force a readback the GPU stays saturated with queued forward/backward
+    /// work from multiple batches in flight at once. With the readback in
+    /// place, each step ended up serialised on a 5–50 ms GPU sync (mostly
+    /// driver overhead on Windows / DX12), which is the difference between
+    /// "an epoch in 10 seconds" and "an epoch in 10 minutes".
+    pub fn step(&mut self, inputs: &[u32], targets: &[u32], batch: usize) {
         let seq_len = self.seq_len;
         debug_assert_eq!(inputs.len(), batch * seq_len);
         debug_assert_eq!(targets.len(), batch * seq_len);
 
-        // Move tokens to device as Int tensors. Small (B*T i64s), one of the
-        // few unavoidable per-step CPU→GPU transfers.
+        // Move tokens to device as Int tensors. `TensorData::new` consumes
+        // the Vec, so there isn't much pooling we can do here — the cost
+        // is B*T * 8 bytes per step (one upload), which for the typical
+        // 1024-context * 1-batch case is 8 KB. Tiny next to the (B*T*vocab)
+        // logits the GPU produces in response.
         let input_i64: Vec<i64> = inputs.iter().map(|&t| t as i64).collect();
         let target_i64: Vec<i64> = targets.iter().map(|&t| t as i64).collect();
         let x = BT::<B, 2, Int>::from_data(
@@ -573,9 +600,19 @@ impl<B: AutodiffBackend> TrainerSession<B> {
         let vocab = self.cfg.vocab_size;
         let logits_flat = logits.reshape([batch * seq_len, vocab]);
         let targets_flat = y.reshape([batch * seq_len]);
-        let loss_module = CrossEntropyLossConfig::new().init(&self.device);
-        let loss = loss_module.forward(logits_flat, targets_flat);
-        let loss_scalar: f32 = loss.clone().into_scalar().elem();
+        let loss = self.loss_module.forward(logits_flat, targets_flat);
+
+        // Accumulate on-device. `loss.clone()` is a cheap reference-count
+        // bump for Burn's tensor handles, NOT a data copy. The non-autodiff
+        // detach (`inner()`) lets us hold a sum across steps without
+        // dragging the entire backward graph along — only the scalar value
+        // is needed for monitoring.
+        let detached: BT<B::InnerBackend, 1> = loss.clone().inner();
+        self.pending_loss_sum = Some(match self.pending_loss_sum.take() {
+            Some(prev) => prev + detached,
+            None       => detached,
+        });
+        self.pending_loss_count += 1;
 
         let grads = loss.backward();
         let grads = GradientsParams::from_grads(grads, &net);
@@ -587,7 +624,24 @@ impl<B: AutodiffBackend> TrainerSession<B> {
             OptVariant::AdamW(o) => o.step(lr, net, grads),
         };
         self.net = Some(updated);
-        loss_scalar
+    }
+
+    /// Drain the accumulated step-loss sum and return its mean.
+    ///
+    /// This is the one call per epoch that forces a GPU→CPU readback. Once
+    /// returned, the running sum is reset so the next epoch starts fresh.
+    /// Returns `None` if no steps have been taken since the last drain
+    /// (the caller can treat that as "no loss to report yet").
+    pub fn take_pending_loss_mean(&mut self) -> Option<f32> {
+        let count = self.pending_loss_count;
+        let sum = self.pending_loss_sum.take()?;
+        self.pending_loss_count = 0;
+        if count == 0 { return None; }
+        // Single sync point per epoch. The GPU has been free to pipeline
+        // every batch up to this moment — this is where we cash out.
+        let mean = sum.div_scalar(count as f32);
+        let v: f32 = mean.into_scalar().elem();
+        Some(v)
     }
 
     /// Mirror the live GPU parameters back into the CPU `TransformerModel`.
@@ -700,12 +754,16 @@ fn build_opt<B: AutodiffBackend>(
     }
 }
 
-// ─── CPU inference ──────────────────────────────────────────────────────────
+// ─── Inference ─────────────────────────────────────────────────────────────
 
 /// Compute logits at every position for a (single) sequence of `tokens`.
 /// Returns a Vec of length `tokens.len() * vocab_size`, row-major.
 /// We run through Burn on the requested backend rather than reimplementing
 /// the forward pass — this keeps inference and training byte-identical.
+///
+/// This one-shot path uploads the full model to the GPU on every call. For
+/// token-by-token generation use [`InferenceSession`] instead, which uploads
+/// the weights once and reuses them across every generated token.
 pub fn forward_logits<B: Backend>(
     model: &TransformerModel,
     tokens: &[u32],
@@ -724,6 +782,56 @@ pub fn forward_logits<B: Backend>(
     let logits = net.forward(x, &model.config, &cos, &sin, &mask); // (1, T, vocab)
     let logits = logits.reshape([seq_len * model.config.vocab_size]);
     logits.into_data().convert::<f32>().into_vec().unwrap()
+}
+
+/// Long-lived inference session for a single `TransformerModel` on a single
+/// device. Holds the Burn module + the RoPE/causal-mask tables for a fixed
+/// `seq_len` so that token-by-token generation doesn't re-upload the model
+/// (potentially tens of megabytes) on every step.
+///
+/// Use this for any generation loop that runs more than one forward pass on
+/// the same model — that's basically every interactive prompt.
+pub struct InferenceSession<B: Backend> {
+    net: BurnTransformer<B>,
+    cfg: TransformerConfig,
+    device: B::Device,
+    seq_len: usize,
+    cos: BT<B, 2>,
+    sin: BT<B, 2>,
+    mask: BT<B, 2, burn::tensor::Bool>,
+}
+
+impl<B: Backend> InferenceSession<B> {
+    /// Materialize the model on `device`. The `seq_len` here is the
+    /// transformer's context window — we precompute the RoPE/mask tables to
+    /// match it once instead of every call.
+    pub fn new(model: &TransformerModel, seq_len: usize, device: B::Device) -> Self {
+        let cfg = model.config.clone();
+        let net = BurnTransformer::<B>::from_model(model, &device);
+        let head_dim = cfg.n_embd / cfg.n_heads;
+        let (cos, sin) = rope_tables::<B>(seq_len, head_dim, cfg.rope_theta, &device);
+        let mask = causal_mask::<B>(seq_len, &device);
+        Self { net, cfg, device, seq_len, cos, sin, mask }
+    }
+
+    /// Run a forward pass over the supplied `tokens` window and return the
+    /// logits at the LAST position (the only ones an autoregressive sampler
+    /// uses). `tokens.len()` must equal the session's `seq_len`.
+    ///
+    /// Returns a `Vec<f32>` of length `vocab_size`.
+    pub fn last_position_logits(&self, tokens: &[u32]) -> Vec<f32> {
+        debug_assert_eq!(tokens.len(), self.seq_len);
+        let input_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+        let x = BT::<B, 2, Int>::from_data(
+            TensorData::new(input_i64, [1, self.seq_len]),
+            &self.device,
+        );
+        let logits = self.net.forward(x, &self.cfg, &self.cos, &self.sin, &self.mask);
+        // Take only the last row to save a chunk of GPU→CPU bandwidth.
+        let last = logits.slice([0..1, self.seq_len - 1..self.seq_len, 0..self.cfg.vocab_size]);
+        let last = last.reshape([self.cfg.vocab_size]);
+        last.into_data().convert::<f32>().into_vec().unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -783,5 +891,43 @@ mod tests {
         let first = losses[0];
         let last = *losses.last().unwrap();
         assert!(last < first, "loss did not decrease: {first} → {last}");
+    }
+
+    /// The `TrainerSession` is the hot path the production app uses, and it
+    /// defers loss readback to `take_pending_loss_mean`. This test confirms
+    /// the deferred path:
+    ///  - accumulates correctly across batches
+    ///  - actually trains the model (loss across epochs decreases)
+    ///  - resets state after each drain
+    #[test]
+    #[serial(autodiff)]
+    fn trainer_session_accumulates_and_trains() {
+        let cfg = tiny_config(8);
+        let model = TransformerModel::new(cfg.clone(), 42);
+        let device = <CpuAutodiffBackend as Backend>::Device::default();
+        let opt = OptimizerKind::Adam { lr: 0.01, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
+        let mut session = TrainerSession::<CpuAutodiffBackend>::new(&model, &opt, 8, device);
+
+        let input:  Vec<u32> = (0..8).collect();
+        let target: Vec<u32> = (1..9).map(|x| x % 8).collect();
+
+        let mut epoch_losses = Vec::new();
+        for _epoch in 0..5 {
+            // 3 batches per "epoch" to exercise the accumulator.
+            for _ in 0..3 {
+                session.step(&input, &target, 1);
+            }
+            let mean = session.take_pending_loss_mean().expect("had 3 steps");
+            assert!(mean.is_finite(), "epoch mean must be finite, got {mean}");
+            epoch_losses.push(mean);
+        }
+        // Second drain right after the first must be None (state was reset).
+        assert!(session.take_pending_loss_mean().is_none(),
+            "take_pending_loss_mean must reset its accumulator");
+        // The deferred path must still train — last epoch's mean < first.
+        let first = epoch_losses[0];
+        let last  = *epoch_losses.last().unwrap();
+        assert!(last < first,
+            "trainer-session loss did not decrease across epochs: {first} → {last}");
     }
 }

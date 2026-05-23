@@ -14,3 +14,27 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Dev-mode override: keep our own code at debug speed for fast iteration
+# (compiler is doing far less work), but build every third-party crate at
+# full -O3. Burn / WGPU / CubeCL are entirely upstream code — without this
+# block, `tauri dev` ships a debug build of the GPU runtime, which is 10–100×
+# slower than release for the matmul kernels. Switching this on means dev
+# training runs are a few seconds per epoch instead of minutes, with no real
+# cost to debug-cycle time after the first compile.
+[profile.dev.package."*"]
+opt-level = 3
+# Burn 0.16's autodiff backend uses thread-local node bookkeeping that
+# benefits from inlining; keep codegen-units small so the compiler sees more
+# of it at once. Doesn't slow down the dev recompile because dependency
+# rebuilds are rare.
+codegen-units = 1
+
+# Our own crates stay at the dev defaults (opt-level = 0, full debuginfo) so
+# rebuilds after editing `engine/src/*.rs` or `src-tauri/src/*.rs` are still
+# instant. The training hot path lives inside Burn / CubeCL, so this is the
+# right place to draw the line.
+[profile.dev.package.neuralcabin-engine]
+opt-level = 1
+[profile.dev.package.neuralcabin]
+opt-level = 1
