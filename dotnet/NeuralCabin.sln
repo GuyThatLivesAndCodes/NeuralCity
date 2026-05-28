@@ -1,0 +1,46 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NeuralCabin.Core", "NeuralCabin.Core\NeuralCabin.Core.csproj", "{E5DEE71B-F029-4241-9B23-83DE195DCFBB}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NeuralCabin.Host", "NeuralCabin.Host\NeuralCabin.Host.csproj", "{7E7AF719-3E20-4DD3-B3A3-2AEF6461126A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NeuralCabin.App", "NeuralCabin.App\NeuralCabin.App.csproj", "{C82833FC-C81C-4C76-9DCD-FB30EB13B45E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NeuralCabin.Core.Tests", "NeuralCabin.Core.Tests\NeuralCabin.Core.Tests.csproj", "{9E1DA2C1-C344-4208-B780-95669F490922}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NeuralCabin.Host.Tests", "NeuralCabin.Host.Tests\NeuralCabin.Host.Tests.csproj", "{7A5C204B-3404-4731-BB9F-668C29A4730A}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{E5DEE71B-F029-4241-9B23-83DE195DCFBB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E5DEE71B-F029-4241-9B23-83DE195DCFBB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E5DEE71B-F029-4241-9B23-83DE195DCFBB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E5DEE71B-F029-4241-9B23-83DE195DCFBB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7E7AF719-3E20-4DD3-B3A3-2AEF6461126A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7E7AF719-3E20-4DD3-B3A3-2AEF6461126A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7E7AF719-3E20-4DD3-B3A3-2AEF6461126A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7E7AF719-3E20-4DD3-B3A3-2AEF6461126A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C82833FC-C81C-4C76-9DCD-FB30EB13B45E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C82833FC-C81C-4C76-9DCD-FB30EB13B45E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C82833FC-C81C-4C76-9DCD-FB30EB13B45E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C82833FC-C81C-4C76-9DCD-FB30EB13B45E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9E1DA2C1-C344-4208-B780-95669F490922}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9E1DA2C1-C344-4208-B780-95669F490922}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9E1DA2C1-C344-4208-B780-95669F490922}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9E1DA2C1-C344-4208-B780-95669F490922}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7A5C204B-3404-4731-BB9F-668C29A4730A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7A5C204B-3404-4731-BB9F-668C29A4730A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7A5C204B-3404-4731-BB9F-668C29A4730A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7A5C204B-3404-4731-BB9F-668C29A4730A}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

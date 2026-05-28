@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The native desktop shell: a Photino window hosting the existing React
+       frontend, with the IPC bridge wired to NeuralCabin.Host. This is the
+       direct replacement for the Tauri shell in `src-tauri/`. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>NeuralCabin</AssemblyName>
+    <RootNamespace>NeuralCabin.App</RootNamespace>
+    <!-- Photino marshals the webview on the UI thread; Windows needs STA. -->
+    <ApplicationIcon></ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Photino.NET" Version="4.0.16" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NeuralCabin.Host\NeuralCabin.Host.csproj" />
+  </ItemGroup>
+
+  <!-- Staged frontend build (frontend/dist → wwwroot) is served by the custom
+       app:// scheme. Copied to output when present; the app still launches
+       with a helpful placeholder if assets haven't been staged yet. -->
+  <ItemGroup Condition="Exists('wwwroot')">
+    <Content Include="wwwroot\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

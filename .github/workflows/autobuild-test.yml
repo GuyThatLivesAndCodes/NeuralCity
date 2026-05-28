@@ -21,6 +21,20 @@ jobs:
       - run: cargo test --package neuralcabin-engine --no-fail-fast
       - run: cargo clippy --package neuralcabin-engine -- -D warnings
 
+  # ── .NET migration: build the new shell + run its test suites (Linux) ────
+  dotnet-tests:
+    name: .NET tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build solution
+        run: dotnet build dotnet/NeuralCabin.sln --configuration Release
+      - name: Run tests
+        run: dotnet test dotnet/NeuralCabin.sln --configuration Release --no-build
+
   # ── Tauri app build (all three platforms) ───────────────────────────────
   build-app:
     name: Build app (${{ matrix.os }})

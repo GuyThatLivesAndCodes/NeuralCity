@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Shared domain models and IPC contracts. Pure DTOs with no platform
+       dependencies, so they compile and unit-test anywhere. These mirror the
+       serde types in `src-tauri/src/models.rs` (and the server types in
+       `lib.rs`) field-for-field so the JSON exchanged with the React frontend
+       is byte-compatible with the Tauri backend. -->
+
+</Project>

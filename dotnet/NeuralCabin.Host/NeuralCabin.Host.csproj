@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Backend logic: the IPC router, command registry, and domain services
+       that replace the Tauri command layer in `src-tauri/src/lib.rs`. This
+       library has NO GUI dependency (no Photino), so it can be unit-tested in
+       a headless environment. The Photino shell (NeuralCabin.App) is a thin
+       composition root on top of it. -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\NeuralCabin.Core\NeuralCabin.Core.csproj" />
+  </ItemGroup>
+
+</Project>

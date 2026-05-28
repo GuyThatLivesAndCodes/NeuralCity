@@ -1,0 +1,15 @@
+<Project>
+  <!-- Shared settings for every project in the NeuralCabin .NET solution.
+       The migration target is a native .NET 8 desktop application that
+       replaces the Tauri shell while preserving the existing React UI. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Mirror the Rust side's `clippy -D warnings` gate: warnings are errors. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+</Project>

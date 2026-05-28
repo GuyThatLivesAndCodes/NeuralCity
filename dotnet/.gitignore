@@ -1,0 +1,7 @@
+# .NET build output
+bin/
+obj/
+*.user
+
+# Frontend assets staged into the host at build time
+NeuralCabin.App/wwwroot/

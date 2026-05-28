@@ -4,6 +4,12 @@ A **pure Rust neural network workbench** built as a **proper desktop app** — n
 
 Powered by [Tauri](https://tauri.app): the Rust backend handles all ML computation and communicates with the React frontend via Tauri IPC. No Python, no PyTorch, no NumPy.
 
+> **🔧 Migration in progress:** NeuralCabin is being migrated from Tauri to a
+> native **.NET** desktop shell ([Photino](https://www.tryphotino.io/)) while
+> preserving the exact UI, styling, and workflows. The Tauri app is still the
+> shipping build; the .NET shell lives in [`dotnet/`](dotnet/). See
+> [`MIGRATION.md`](MIGRATION.md) for the architecture, status, and roadmap.
+
 ## Quick Start
 
 ### Download & install (pre-built)

@@ -1,5 +1,7 @@
-import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+// Host-agnostic IPC primitives. These route to either the Tauri shell or the
+// native .NET (Photino) shell automatically — see frontend/src/host. The rest
+// of this file is unchanged and unaware of which backend answers.
+import { invoke, listen, type UnlistenFn } from './host'
 
 // ─── Network ────────────────────────────────────────────────────────────────
 
