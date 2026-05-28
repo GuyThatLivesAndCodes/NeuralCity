@@ -395,32 +395,6 @@ fn parse_linear_frozen_keys(keys: &[String]) -> Vec<usize> {
     out
 }
 
-/// Snapshot a chosen subset of `Layer::Linear` weight+bias pairs. The slot
-/// number is the position among linear layers (not all layers), so
-/// `linear:0` is the first linear layer regardless of preceding activations.
-fn snapshot_linear_layers(model: &Model, linear_indices: &[usize]) -> Vec<(usize, Tensor, Tensor)> {
-    let mut snaps = Vec::new();
-    let mut lin_n = 0_usize;
-    for (i, layer) in model.layers.iter().enumerate() {
-        if let Layer::Linear(l) = layer {
-            if linear_indices.contains(&lin_n) {
-                snaps.push((i, l.w.clone(), l.b.clone()));
-            }
-            lin_n += 1;
-        }
-    }
-    snaps
-}
-
-fn restore_linear_layers(model: &mut Model, snaps: &[(usize, Tensor, Tensor)]) {
-    for (i, w, b) in snaps {
-        if let Some(Layer::Linear(l)) = model.layers.get_mut(*i) {
-            l.w = w.clone();
-            l.b = b.clone();
-        }
-    }
-}
-
 fn build_layer_specs(layers: &[LayerDef], input_dim: usize) -> Result<(Vec<LayerSpec>, usize), String> {
     let mut specs = Vec::with_capacity(layers.len());
     let mut cur = input_dim;
@@ -1735,14 +1709,14 @@ async fn run_training_loop(
         m.clone()
     };
 
-    // Build the optimizer from the model's parameter shapes. We acquire the
-    // lock briefly here (not held across the training loop) so that other
-    // commands — persistence, inference — can still access the model.
+    // Validate the optimizer config (shapes are accepted for API symmetry but
+    // unused by the Burn path). Surfacing a bad optimizer string here gives the
+    // UI a clean error instead of a run that silently does nothing.
     let shapes = {
         let m = model_arc.read().await;
         m.parameter_shapes()
     };
-    let optimizer = match build_optimizer(&cfg.optimizer, &shapes) {
+    let opt_kind = match build_optimizer(&cfg.optimizer, &shapes) {
         Ok(o) => o,
         Err(e) => {
             mark_error(&training_state, &training_id, &app, e).await;
@@ -1755,13 +1729,32 @@ async fn run_training_loop(
     let mut rng = SplitMix64::new(cfg.seed.wrapping_add(0xA5A5_5A5A_5A5A_A5A5));
     let mut indices: Vec<usize> = (0..n).collect();
 
-    // Instantiate the WGPU device once for the entire training run. This is
-    // where the migration to Burn becomes visible at runtime — all subsequent
-    // tensor work happens on this device. On laptops without a discrete GPU,
-    // WGPU falls back to an integrated GPU; if neither is available it falls
-    // back to a CPU compute pipeline.
+    // Instantiate the WGPU device once for the entire training run. On laptops
+    // without a discrete GPU, WGPU falls back to an integrated GPU; if neither
+    // is available it falls back to a CPU compute pipeline.
     let device = neuralcabin_engine::default_gpu_device();
-    let mut step_counter: u64 = 0;
+
+    // Build the trainer session ONCE per run. Like the transformer path, this
+    // keeps the model weights and the optimizer — crucially, its Adam/SGD
+    // momentum/variance buffers — resident on the GPU for the whole run. The
+    // previous code called `train_step_on_device` per batch, which rebuilt the
+    // optimizer from scratch every step (zeroing Adam's moments → effectively
+    // LR-scaled SGD) and re-uploaded every weight to the GPU each step. That
+    // both crippled convergence and added a CPU↔GPU round trip per batch.
+    let mut session = neuralcabin_engine::MlpTrainerSession::<
+        neuralcabin_engine::GpuAutodiffBackend,
+    >::new(
+        &*model_arc.read().await,
+        &opt_kind,
+        loss_kind,
+        device,
+    );
+
+    // Parse the frozen linear-layer slots once. The session does on-device
+    // snapshot/restore around each step so frozen weights don't move while
+    // gradients still flow through them.
+    let frozen_indices = parse_linear_frozen_keys(&frozen_layers);
+    let has_frozen = !frozen_indices.is_empty();
 
     /// Run the cleanup path for a cancelled training run. Honours `rollback`
     /// to decide whether to keep or revert the in-progress weights, records
@@ -1821,6 +1814,11 @@ async fn run_training_loop(
 
     for epoch in 1..=cfg.epochs {
         if cancel.load(Ordering::Relaxed) {
+            // Sync the latest GPU weights back unless we're rolling back anyway.
+            if !rollback.load(Ordering::Relaxed) {
+                let mut m = model_arc.write().await;
+                session.write_back(&mut m);
+            }
             finish_cancelled(
                 &app, &training_id, &network_id, &cfg, started_at,
                 epoch.saturating_sub(1), &loss_history, start,
@@ -1848,24 +1846,19 @@ async fn run_training_loop(
             }
             let bx = Tensor::new(vec![chunk.len(), in_dim], bx);
             let by = Tensor::new(vec![chunk.len(), out_dim], by);
-            // Acquire the model lock for just one optimisation step, then
-            // release it. This is what lets `persist()` and `infer()` proceed
-            // between batches instead of waiting for the whole run to finish.
-            let loss = {
-                let mut model = model_arc.write().await;
-                step_counter += 1;
-                // Snapshot frozen linear layers, run the optimiser step,
-                // then restore — net effect is gradient flows through them
-                // but weights don't move. Matches how the transformer path
-                // handles its own frozen components.
-                let frozen_indices = parse_linear_frozen_keys(&frozen_layers);
-                let snaps = snapshot_linear_layers(&model, &frozen_indices);
-                let l = neuralcabin_engine::train_step_on_device::<neuralcabin_engine::GpuAutodiffBackend>(
-                    &mut model, &optimizer, step_counter, loss_kind, &bx, &by, &device,
-                );
-                restore_linear_layers(&mut model, &snaps);
-                l
+            // Snapshot frozen layers, run the optimiser step on the resident
+            // session, then restore — gradients flow through frozen layers but
+            // their weights don't move. The session keeps the model on the GPU
+            // for the whole run; we sync back to the CPU model once per epoch.
+            let frozen_snap = if has_frozen {
+                Some(session.snapshot_frozen(&frozen_indices))
+            } else {
+                None
             };
+            let loss = session.step(&bx, &by);
+            if let Some(snap) = &frozen_snap {
+                session.restore_frozen(snap);
+            }
             if !loss.is_finite() {
                 let elapsed = start.elapsed().as_secs_f32();
                 let run = build_training_run_record(
@@ -1883,6 +1876,13 @@ async fn run_training_loop(
         }
         let mean_loss = epoch_loss / batches.max(1) as f32;
         loss_history.push(mean_loss);
+
+        // Sync the GPU weights to the CPU model once per epoch so inference,
+        // autosave, and UI snapshots see the latest weights.
+        {
+            let mut m = model_arc.write().await;
+            session.write_back(&mut m);
+        }
 
         let elapsed = start.elapsed().as_secs_f32();
         {

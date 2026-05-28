@@ -25,7 +25,9 @@ pub use backend::{
     default_gpu_device, CpuAutodiffBackend, CpuBackend, GpuAutodiffBackend, GpuBackend, GpuDevice,
 };
 pub use loss::Loss;
-pub use nn::{train_step_on_device, Layer, LayerSpec, Model};
+pub use nn::{
+    train_step_on_device, FrozenLinearSnapshotGpu, Layer, LayerSpec, MlpTrainerSession, Model,
+};
 pub use optimizer::{Optimizer, OptimizerKind};
 pub use tensor::Tensor;
 pub use tokenizer::{TokenizerMode, Vocabulary};
