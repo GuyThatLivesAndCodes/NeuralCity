@@ -18,8 +18,10 @@ use crate::loss::Loss;
 use crate::optimizer::OptimizerKind;
 use crate::tensor::{SplitMix64, Tensor};
 use burn::module::{Module, Param};
+use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{
-    AdamConfig, AdamWConfig, GradientsParams, Optimizer as BurnOptimizer, SgdConfig,
+    Adam, AdamConfig, AdamW, AdamWConfig, GradientsParams, Optimizer as BurnOptimizer, Sgd,
+    SgdConfig,
 };
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Tensor as BurnTensor};
@@ -102,6 +104,23 @@ pub struct Model {
 // (so the optimizer can update them) and the indices of the linear layers in
 // the parent `Model` so we can write the updated weights back out.
 
+/// Lightweight structural description of a model's layer sequence. Carries the
+/// order of linear vs. activation layers (and which activation) without
+/// holding any weights, so a `TrainerSession` can drive the Burn forward pass
+/// without keeping a second copy of the model's tensors.
+#[derive(Clone, Debug)]
+enum LayerPlan {
+    Linear,
+    Activation(Activation),
+}
+
+fn layer_plan(model: &Model) -> Vec<LayerPlan> {
+    model.layers.iter().map(|l| match l {
+        Layer::Linear(_) => LayerPlan::Linear,
+        Layer::Activation(a) => LayerPlan::Activation(*a),
+    }).collect()
+}
+
 #[derive(Module, Debug)]
 struct BurnNet<B: Backend> {
     /// Linear layer weights, in order of appearance. `weights[i]` has shape
@@ -124,15 +143,17 @@ impl<B: Backend> BurnNet<B> {
         Self { weights, biases }
     }
 
-    /// Run a forward pass for the given activation sequence. `model` provides
-    /// the layer structure (linear / activation / linear / ...); we consume
-    /// the Params in order.
-    fn forward(&self, model: &Model, x: BurnTensor<B, 2>) -> BurnTensor<B, 2> {
+    /// Run a forward pass for the given layer sequence. `plan` describes the
+    /// linear / activation / linear / ... structure; we consume the Params in
+    /// order. The plan is a lightweight structural view (it carries no
+    /// weights) so a long-lived `TrainerSession` can keep it without holding a
+    /// second copy of the model's tensors.
+    fn forward(&self, plan: &[LayerPlan], x: BurnTensor<B, 2>) -> BurnTensor<B, 2> {
         let mut linear_idx = 0_usize;
         let mut out = x;
-        for layer in &model.layers {
+        for layer in plan {
             match layer {
-                Layer::Linear(_) => {
+                LayerPlan::Linear => {
                     let w = self.weights[linear_idx].val();
                     let b = self.biases[linear_idx].val();
                     // out = out @ w  + b (broadcast over rows)
@@ -143,7 +164,7 @@ impl<B: Backend> BurnNet<B> {
                     out = z + bb;
                     linear_idx += 1;
                 }
-                Layer::Activation(a) => {
+                LayerPlan::Activation(a) => {
                     out = a.apply_burn(out);
                 }
             }
@@ -300,7 +321,7 @@ impl Model {
     ) -> Tensor {
         let net = BurnNet::<B>::from_model(self, device);
         let x = input.to_burn_2d::<B>(device);
-        let y = net.forward(self, x);
+        let y = net.forward(&layer_plan(self), x);
         Tensor::from_burn_2d::<B>(y)
     }
 }
@@ -340,7 +361,7 @@ pub fn train_step_on_device<B: AutodiffBackend>(
     let t = target.to_burn_2d::<B>(device);
 
     // 3. Forward + loss.
-    let pred = net.forward(model, x);
+    let pred = net.forward(&layer_plan(model), x);
     let loss = loss_kind.forward_burn::<B>(pred, t);
     let loss_scalar: f32 = loss.clone().into_scalar().elem();
 
@@ -414,6 +435,155 @@ fn step_with_optimizer<B: AutodiffBackend>(
     }
 }
 
+// ─── Persistent trainer session ─────────────────────────────────────────────
+
+/// Burn optimizer state for one feed-forward training run. Built once and
+/// reused for every step so Adam/AdamW/LAMB/SGD actually keep their
+/// momentum/variance buffers between steps.
+///
+/// The per-step `train_step_on_device` path re-created the optimizer on every
+/// call, which silently turned Adam into a zero-moment update (≈ LR-scaled
+/// SGD) and re-uploaded every weight to the GPU each step. Holding the
+/// optimizer and module resident for the whole run fixes the convergence
+/// regression and removes the per-step CPU↔GPU round trip — the same fix the
+/// transformer path already shipped via `transformer::TrainerSession`.
+enum FfOptVariant<B: AutodiffBackend> {
+    Sgd(OptimizerAdaptor<Sgd<B::InnerBackend>, BurnNet<B>, B>),
+    Adam(OptimizerAdaptor<Adam, BurnNet<B>, B>),
+    AdamW(OptimizerAdaptor<AdamW, BurnNet<B>, B>),
+}
+
+/// A long-lived training session for a single feed-forward `Model` on a single
+/// device. Holds the Burn module (so its parameters live on the device for the
+/// whole run instead of being uploaded every step) and the optimizer, with its
+/// state preserved across steps.
+///
+/// Call `step` per batch; call `write_back` periodically (e.g. once per epoch)
+/// to sync the device weights to the CPU `Model` for persistence/inference.
+pub struct MlpTrainerSession<B: AutodiffBackend> {
+    /// `Option` because `BurnOptimizer::step` takes the module by value and
+    /// returns the updated one — we `take()`, step, and put it back.
+    net: Option<BurnNet<B>>,
+    opt: FfOptVariant<B>,
+    plan: Vec<LayerPlan>,
+    loss_kind: Loss,
+    device: B::Device,
+    lr: f64,
+}
+
+/// On-device snapshot of frozen linear layers. Cheap to capture (Burn tensors
+/// are reference-counted) and avoids a full GPU→CPU→GPU round trip. The index
+/// is the position among linear layers (`linear:N`), matching `BurnNet`'s
+/// per-linear ordering.
+pub struct FrozenLinearSnapshotGpu<B: AutodiffBackend> {
+    entries: Vec<(usize, BurnTensor<B, 2>, BurnTensor<B, 2>)>,
+}
+
+impl<B: AutodiffBackend> MlpTrainerSession<B> {
+    /// Build a session: upload the model to `device` once and build the
+    /// optimizer once.
+    pub fn new(
+        model: &Model,
+        kind: &OptimizerKind,
+        loss_kind: Loss,
+        device: B::Device,
+    ) -> Self {
+        let net = BurnNet::<B>::from_model(model, &device);
+        let plan = layer_plan(model);
+        let (opt, lr) = build_ff_opt::<B>(kind);
+        Self { net: Some(net), opt, plan, loss_kind, device, lr }
+    }
+
+    /// One training step on an `(input, target)` batch. Returns the loss.
+    pub fn step(&mut self, input: &Tensor, target: &Tensor) -> f32 {
+        let x = input.to_burn_2d::<B>(&self.device);
+        let t = target.to_burn_2d::<B>(&self.device);
+        let net = self.net.take().expect("session net is always Some between steps");
+        let pred = net.forward(&self.plan, x);
+        let loss = self.loss_kind.forward_burn::<B>(pred, t);
+        let loss_scalar: f32 = loss.clone().into_scalar().elem();
+
+        let grads = loss.backward();
+        let grads = GradientsParams::from_grads(grads, &net);
+
+        let lr = self.lr;
+        let updated = match &mut self.opt {
+            FfOptVariant::Sgd(o)   => o.step(lr, net, grads),
+            FfOptVariant::Adam(o)  => o.step(lr, net, grads),
+            FfOptVariant::AdamW(o) => o.step(lr, net, grads),
+        };
+        self.net = Some(updated);
+        loss_scalar
+    }
+
+    /// Mirror the live device parameters back into the CPU `Model`. Do this
+    /// once per epoch / on checkpoint, not per step.
+    pub fn write_back(&self, model: &mut Model) {
+        let net = self.net.as_ref().expect("session net is always Some between steps");
+        let mut linear_idx = 0_usize;
+        for layer in &mut model.layers {
+            if let Layer::Linear(l) = layer {
+                l.w = Tensor::from_burn_2d::<B>(net.weights[linear_idx].val());
+                l.b = Tensor::from_burn_2d::<B>(net.biases[linear_idx].val());
+                linear_idx += 1;
+            }
+        }
+    }
+
+    /// Snapshot the chosen linear layers straight off the device so they can
+    /// be restored verbatim after the optimizer step (= frozen weights).
+    /// `linear_indices` are positions among linear layers.
+    pub fn snapshot_frozen(&self, linear_indices: &[usize]) -> FrozenLinearSnapshotGpu<B> {
+        let net = self.net.as_ref().expect("session net is always Some between steps");
+        let mut entries = Vec::new();
+        for &idx in linear_indices {
+            if idx < net.weights.len() {
+                entries.push((idx, net.weights[idx].val(), net.biases[idx].val()));
+            }
+        }
+        FrozenLinearSnapshotGpu { entries }
+    }
+
+    /// Re-install a frozen-layer snapshot. Called after each optimizer step so
+    /// frozen layers stay put while the rest of the network updates. Gradients
+    /// still flow through them — only the weight update is undone.
+    pub fn restore_frozen(&mut self, snap: &FrozenLinearSnapshotGpu<B>) {
+        let net = self.net.as_mut().expect("session net is always Some between steps");
+        for (idx, w, b) in &snap.entries {
+            net.weights[*idx] = Param::from_tensor(w.clone());
+            net.biases[*idx]  = Param::from_tensor(b.clone());
+        }
+    }
+}
+
+fn build_ff_opt<B: AutodiffBackend>(kind: &OptimizerKind) -> (FfOptVariant<B>, f64) {
+    match *kind {
+        OptimizerKind::Sgd { lr, momentum } => {
+            let cfg = if momentum > 0.0 {
+                SgdConfig::new().with_momentum(Some(burn::optim::momentum::MomentumConfig {
+                    momentum: momentum as f64, dampening: 0.0, nesterov: false,
+                }))
+            } else {
+                SgdConfig::new()
+            };
+            (FfOptVariant::Sgd(cfg.init::<B, BurnNet<B>>()), lr as f64)
+        }
+        OptimizerKind::Adam { lr, beta1, beta2, eps } => {
+            let cfg = AdamConfig::new().with_beta_1(beta1).with_beta_2(beta2).with_epsilon(eps);
+            (FfOptVariant::Adam(cfg.init::<B, BurnNet<B>>()), lr as f64)
+        }
+        OptimizerKind::AdamW { lr, beta1, beta2, eps, weight_decay }
+        | OptimizerKind::Lamb { lr, beta1, beta2, eps, weight_decay } => {
+            // Burn 0.16 has no stand-alone LAMB; AdamW is the closest drop-in
+            // (matches the per-step `step_with_optimizer` routing above).
+            let cfg = AdamWConfig::new()
+                .with_beta_1(beta1).with_beta_2(beta2).with_epsilon(eps)
+                .with_weight_decay(weight_decay);
+            (FfOptVariant::AdamW(cfg.init::<B, BurnNet<B>>()), lr as f64)
+        }
+    }
+}
+
 // ─── CPU inference for the original public API ──────────────────────────────
 //
 // External callers still use `Model::predict(&Tensor) -> Tensor` and don't
@@ -451,5 +621,86 @@ mod tests {
         // note in `step_with_optimizer`. Convergence is slower than the
         // hand-rolled implementation, so we relax the tolerance accordingly.
         assert!(last < 0.20, "XOR did not converge: loss={last}");
+    }
+
+    /// The same XOR problem, but trained through `MlpTrainerSession`, which
+    /// keeps Adam's momentum/variance state alive across steps. With real Adam
+    /// it converges far below the per-step path's 0.20 floor in half the
+    /// steps — this both exercises the session and locks in the fix.
+    #[test]
+    #[serial_test::serial(autodiff)]
+    fn session_mlp_learns_xor() {
+        use crate::backend::CpuAutodiffBackend;
+        let specs = vec![
+            LayerSpec::Linear { in_dim: 2, out_dim: 8 },
+            LayerSpec::Activation(Activation::Tanh),
+            LayerSpec::Linear { in_dim: 8, out_dim: 1 },
+            LayerSpec::Activation(Activation::Sigmoid),
+        ];
+        let mut model = Model::from_specs(2, &specs, 42);
+        let opt = OptimizerKind::Adam { lr: 0.05, beta1: 0.9, beta2: 0.999, eps: 1e-8 };
+        let x = Tensor::new(vec![4, 2], vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+        let y = Tensor::new(vec![4, 1], vec![0.0, 1.0, 1.0, 0.0]);
+        let device = <CpuAutodiffBackend as Backend>::Device::default();
+        let mut session = MlpTrainerSession::<CpuAutodiffBackend>::new(
+            &model, &opt, Loss::MeanSquaredError, device,
+        );
+        let mut last = f32::INFINITY;
+        for _ in 0..1500 {
+            last = session.step(&x, &y);
+        }
+        assert!(last < 0.05, "session XOR did not converge: loss={last}");
+        // Weights written back to the CPU model must reproduce the low loss
+        // through the eager forward path used for inference.
+        session.write_back(&mut model);
+        let eval = model.evaluate_loss(Loss::MeanSquaredError, &x, &y);
+        assert!(eval < 0.05, "written-back model loss too high: {eval}");
+    }
+
+    /// Freezing a linear layer through the session must leave its weights
+    /// byte-identical after a step, while the rest of the network still moves.
+    #[test]
+    #[serial_test::serial(autodiff)]
+    fn session_frozen_linear_stays_put() {
+        use crate::backend::CpuAutodiffBackend;
+        let specs = vec![
+            LayerSpec::Linear { in_dim: 2, out_dim: 4 },
+            LayerSpec::Activation(Activation::Tanh),
+            LayerSpec::Linear { in_dim: 4, out_dim: 1 },
+        ];
+        let mut model = Model::from_specs(2, &specs, 7);
+        let frozen_w0 = match &model.layers[0] {
+            Layer::Linear(l) => l.w.clone(),
+            _ => unreachable!(),
+        };
+        let opt = OptimizerKind::Sgd { lr: 0.5, momentum: 0.0 };
+        let x = Tensor::new(vec![2, 2], vec![0.0, 1.0, 1.0, 0.0]);
+        let y = Tensor::new(vec![2, 1], vec![1.0, 0.0]);
+        let device = <CpuAutodiffBackend as Backend>::Device::default();
+        let mut session = MlpTrainerSession::<CpuAutodiffBackend>::new(
+            &model, &opt, Loss::MeanSquaredError, device,
+        );
+        // Freeze the first linear layer (slot 0).
+        for _ in 0..10 {
+            let snap = session.snapshot_frozen(&[0]);
+            session.step(&x, &y);
+            session.restore_frozen(&snap);
+        }
+        session.write_back(&mut model);
+        let after_w0 = match &model.layers[0] {
+            Layer::Linear(l) => l.w.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(frozen_w0.data, after_w0.data, "frozen layer 0 weights moved");
+        // The trainable output layer should have changed.
+        let out_w = match &model.layers[2] {
+            Layer::Linear(l) => l.w.clone(),
+            _ => unreachable!(),
+        };
+        let initial_out = match &Model::from_specs(2, &specs, 7).layers[2] {
+            Layer::Linear(l) => l.w.clone(),
+            _ => unreachable!(),
+        };
+        assert_ne!(out_w.data, initial_out.data, "trainable layer 2 did not move");
     }
 }
