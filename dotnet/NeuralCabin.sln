@@ -13,6 +13,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NeuralCabin.Core.Tests", "N
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NeuralCabin.Host.Tests", "NeuralCabin.Host.Tests\NeuralCabin.Host.Tests.csproj", "{7A5C204B-3404-4731-BB9F-668C29A4730A}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NeuralCabin.Engine", "NeuralCabin.Engine\NeuralCabin.Engine.csproj", "{370D3F60-B4CD-4BB9-ACA4-779BE9FE1418}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NeuralCabin.Engine.Tests", "NeuralCabin.Engine.Tests\NeuralCabin.Engine.Tests.csproj", "{2E99C806-AD4C-43A6-8E02-79F60832CCDA}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -42,5 +46,13 @@ Global
 		{7A5C204B-3404-4731-BB9F-668C29A4730A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{7A5C204B-3404-4731-BB9F-668C29A4730A}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{7A5C204B-3404-4731-BB9F-668C29A4730A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{370D3F60-B4CD-4BB9-ACA4-779BE9FE1418}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{370D3F60-B4CD-4BB9-ACA4-779BE9FE1418}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{370D3F60-B4CD-4BB9-ACA4-779BE9FE1418}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{370D3F60-B4CD-4BB9-ACA4-779BE9FE1418}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2E99C806-AD4C-43A6-8E02-79F60832CCDA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2E99C806-AD4C-43A6-8E02-79F60832CCDA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2E99C806-AD4C-43A6-8E02-79F60832CCDA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2E99C806-AD4C-43A6-8E02-79F60832CCDA}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

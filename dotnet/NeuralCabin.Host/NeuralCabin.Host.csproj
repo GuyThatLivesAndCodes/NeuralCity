@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\NeuralCabin.Core\NeuralCabin.Core.csproj" />
+    <ProjectReference Include="..\NeuralCabin.Engine\NeuralCabin.Engine.csproj" />
   </ItemGroup>
 
 </Project>

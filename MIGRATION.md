@@ -72,15 +72,15 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 | IPC bridge (`invoke`/`emit`) | ✅ | C# router + TS shim, with end-to-end tests. |
 | Shared models / DTOs | ✅ | All of `models.rs` + server types ported; JSON contract under test. |
 | Frontend host-agnostic seam | ✅ | `frontend/src/host` + one import change in `api.ts`. |
-| **Networks** commands | 🟡 | `create` (feedforward + next-token), `list`, `get`, `delete` implemented in-memory. Transformer `create` and **disk persistence** pending. |
-| Events plumbing | 🟡 | Channel + emitter implemented; no producers yet (training/inference not ported). |
-| Corpus / Vocabulary | ⬜ | Needs tokenizer port (`engine/tokenizer.rs`). |
-| Training loop | ⬜ | Needs engine. |
-| Inference (sync + streaming) | ⬜ | Needs engine. |
+| **Networks** commands | ✅ | `create` (feedforward materializes a model; next-token stores its chain), `list`, `get`, `delete`, persisted. Transformer `create` pending the transformer engine. |
+| Events plumbing | ✅ | `training_*` events produced by the feed-forward loop. `inference_*` streaming events pending (next-token/transformer). |
+| Corpus | 🟡 | Feed-forward corpus + stats done and persisted. Next-token text/pairs stored; **vocabulary build** pending the tokenizer port. |
+| Training loop | 🟡 | Feed-forward fully ported: per-epoch deterministic shuffle, mini-batches, persistent-optimizer session, layer freezing, live events, history, stop/abort+rollback. Next-token/transformer pending. |
+| Inference | 🟡 | Feed-forward sync `infer` + `infer_with_activations` done. Next-token/transformer streaming pending. |
 | Export (pytorch/onnx/gguf) | ⬜ | Port `src-tauri/export.rs`. |
 | Embedded API server | ⬜ | Port `src-tauri/server.rs` (axum → ASP.NET Core minimal API / `HttpListener`). |
-| Persistence (`state.json`, `models/`) | ⬜ | Port `src-tauri/persistence.rs`; must read/write the same on-disk format for a seamless switch. |
-| **ML engine** | ⬜ | Hardest piece — now Burn-backed (wgpu/autodiff). Decide: interop with the Rust engine via a native library, or port to a .NET ML stack (TorchSharp / hand-rolled). |
+| Persistence (`state.json`, `models/`) | 🟡 | `state.json` (networks/corpora/history) + **serde-compatible** model files done. Vocab/transformer/server persistence and reading a legacy Tauri `state.json` pending. |
+| **ML engine** | 🟡 | **MLP/feed-forward engine ported to pure C#** — tensors, analytic backprop, SGD/Adam/AdamW, losses, serde-compatible model JSON — validated by finite-difference gradient checks + XOR convergence. **Tokenizer + transformer (RoPE/RMSNorm/attention fwd+bwd) still to port.** |
 
 ### Remaining Tauri dependencies
 
@@ -92,16 +92,20 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 ## Roadmap (ordered)
 
-1. **Engine decision + spike** — interop vs. port. This unblocks training,
-   inference, vocab, corpus stats, and transformer creation.
-2. **Persistence** — read/write the existing `state.json` + `models/<id>.json`
-   so a user's data carries over to the .NET app unchanged.
-3. **Corpus + Vocabulary** commands (tokenizer port).
-4. **Training** loop + `training_*` events.
-5. **Inference** (feed-forward sync, next-token streaming) + `inference_*` events.
-6. **Export** (pytorch/onnx/gguf).
-7. **Embedded API server**.
-8. **Cutover** — default the host shim to `dotnet`, ship the Photino bundle from
+- [x] **Engine decision + spike** — chose a pure-C# port (no Rust/Burn). MLP
+  engine ported and gradient-checked.
+- [x] **Persistence** — `state.json` + serde-compatible `models/<id>.json`.
+- [x] **Feed-forward vertical** — create / corpus / train (+events) / infer,
+  end-to-end through the bridge.
+1. **Tokenizer + Vocabulary** — port `engine/tokenizer.rs`; `build_vocabulary`,
+   `set_advanced_vocabulary`, `get_vocabulary`, `tokenize_preview`; materialize
+   next-token models once a vocab exists.
+2. **Next-token training + streaming inference** (`inference_*` events).
+3. **Transformer engine** — RoPE / RMSNorm / attention / SwiGLU forward **and**
+   analytic backward; transformer create / train / infer.
+4. **Export** (pytorch / onnx / gguf) — port `src-tauri/export.rs`.
+5. **Embedded API server** — port `src-tauri/server.rs`.
+6. **Cutover** — default the host shim to `dotnet`, ship the Photino bundle from
    CI, then retire `src-tauri/` and the Tauri toolchain.
 
 ## Build, test, run

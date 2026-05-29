@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The NeuralCabin ML engine, ported from the Rust `engine/` crate to pure
+       C# (no Burn / native deps). Tensors, autograd-by-hand (analytic backprop),
+       optimizers, activations, losses, and model (de)serialization compatible
+       with the Rust on-disk format. -->
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="NeuralCabin.Engine.Tests" />
+  </ItemGroup>
+
+</Project>

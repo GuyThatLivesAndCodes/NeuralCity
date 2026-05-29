@@ -95,7 +95,9 @@ public class IpcRouterTests
     {
         var (router, transport) = NewRouter();
 
-        await router.HandleMessageAsync(InvokeMessage("t1", CommandNames.StartTraining, new { req = new { } }));
+        // export_network is not yet ported, so it should report migration status.
+        await router.HandleMessageAsync(InvokeMessage("t1", CommandNames.ExportNetwork,
+            new { networkId = "x", format = "onnx" }));
 
         var response = ParseLast(transport);
         Assert.False(response.GetProperty("ok").GetBoolean());

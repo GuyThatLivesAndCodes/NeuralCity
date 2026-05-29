@@ -1,6 +1,7 @@
 using NeuralCabin.Core.Models;
 using NeuralCabin.Host.Ipc;
 using NeuralCabin.Host.Services;
+using NeuralCabin.Host.State;
 using Xunit;
 
 namespace NeuralCabin.Host.Tests;
@@ -23,7 +24,7 @@ public class NetworkServiceTests
     [Fact]
     public void Create_feedforward_counts_parameters_and_derives_output_dim()
     {
-        var service = new NetworkService();
+        var service = new NetworkService(new AppState());
         var network = service.Create(Feedforward(
             new LinearLayer { InDim = 3, OutDim = 4 },
             new ActivationLayer { Activation = "relu" },
@@ -42,7 +43,7 @@ public class NetworkServiceTests
     [Fact]
     public void Create_feedforward_rejects_dim_mismatch()
     {
-        var service = new NetworkService();
+        var service = new NetworkService(new AppState());
         var ex = Assert.Throws<CommandException>(() => service.Create(Feedforward(
             new LinearLayer { InDim = 3, OutDim = 4 },
             new LinearLayer { InDim = 5, OutDim = 2 }))); // 5 != running dim 4
@@ -52,7 +53,7 @@ public class NetworkServiceTests
     [Fact]
     public void Create_feedforward_requires_at_least_one_layer()
     {
-        var service = new NetworkService();
+        var service = new NetworkService(new AppState());
         var request = new CreateNetworkRequest { Name = "N", Kind = NetworkKinds.Feedforward, InputDim = 2 };
         var ex = Assert.Throws<CommandException>(() => service.Create(request));
         Assert.Contains("at least one layer", ex.Message);
@@ -61,7 +62,7 @@ public class NetworkServiceTests
     [Fact]
     public void Create_feedforward_requires_positive_input_dim()
     {
-        var service = new NetworkService();
+        var service = new NetworkService(new AppState());
         var request = new CreateNetworkRequest
         {
             Name = "N",
@@ -76,7 +77,7 @@ public class NetworkServiceTests
     [Fact]
     public void Create_rejects_empty_name_and_unknown_kind()
     {
-        var service = new NetworkService();
+        var service = new NetworkService(new AppState());
         Assert.Throws<CommandException>(() => service.Create(new CreateNetworkRequest
         {
             Name = "   ",
@@ -95,7 +96,7 @@ public class NetworkServiceTests
     [Fact]
     public void Create_next_token_stores_hidden_chain_without_engine()
     {
-        var service = new NetworkService();
+        var service = new NetworkService(new AppState());
         var network = service.Create(new CreateNetworkRequest
         {
             Name = "Gen",
@@ -116,7 +117,7 @@ public class NetworkServiceTests
     [Fact]
     public void Create_transformer_is_deferred_to_engine_port()
     {
-        var service = new NetworkService();
+        var service = new NetworkService(new AppState());
         Assert.Throws<NotYetMigratedException>(() => service.Create(new CreateNetworkRequest
         {
             Name = "T",
@@ -128,7 +129,7 @@ public class NetworkServiceTests
     [Fact]
     public void List_get_and_delete_round_trip()
     {
-        var service = new NetworkService();
+        var service = new NetworkService(new AppState());
         var a = service.Create(Feedforward(new LinearLayer { InDim = 2, OutDim = 1 }));
         var b = service.Create(Feedforward(new LinearLayer { InDim = 2, OutDim = 1 }));
 
