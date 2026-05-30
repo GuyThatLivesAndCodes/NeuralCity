@@ -2046,13 +2046,22 @@ async fn infer_transformer(
                 });
                 break;
             }
-            // Take the last n_ctx tokens; pad-left with EOS if shorter.
-            let mut window: Vec<u32> = if ids.len() >= n_ctx {
+            // Feed the actual context window — the last n_ctx real tokens,
+            // with no left-padding. Padding with EOS used to shift the real
+            // tokens to later RoPE positions than training ever saw (training
+            // always places real content from position 0), which is both a
+            // train/inference mismatch and wasteful: attention is O(seq_len²),
+            // so pinning every step at the full n_ctx length recomputed far
+            // more than necessary for short prompts. A short prompt now does a
+            // short forward pass that grows only as the sequence grows.
+            let window: Vec<u32> = if ids.len() > n_ctx {
                 ids[ids.len() - n_ctx..].to_vec()
+            } else if ids.is_empty() {
+                // Empty prompt (non-chat): seed with a single EOS so there is
+                // always at least one position to predict from.
+                vec![EOS_ID]
             } else {
-                let mut w = vec![EOS_ID; n_ctx - ids.len()];
-                w.extend_from_slice(&ids);
-                w
+                ids.clone()
             };
             // forward returns logits for every position; we want the LAST one.
             let model = model_arc.read().await;
@@ -2084,9 +2093,6 @@ async fn infer_transformer(
             });
             if (chosen as u32) == EOS_ID { break; }
             ids.push(chosen as u32);
-            // Suppress unused warning while we keep the variable for future
-            // KV-cache work — the window is recomputed every step today.
-            let _ = &mut window;
             tokio::task::yield_now().await;
         }
         let _ = app_clone.emit("inference_finished", InferenceFinished {
