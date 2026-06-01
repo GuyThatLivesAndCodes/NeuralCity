@@ -700,30 +700,91 @@ fn build_opt<B: AutodiffBackend>(
     }
 }
 
+// ─── Inference ──────────────────────────────────────────────────────────────
+
+/// A long-lived inference session for a single `TransformerModel` on a single
+/// device, mirroring `TrainerSession` for the forward-only path.
+///
+/// Autoregressive generation calls the forward pass once per new token. The
+/// previous implementation (`forward_logits`) rebuilt the entire
+/// `BurnTransformer` — re-uploading every weight from CPU to the GPU — and
+/// re-filled the RoPE trig tables plus the `seq_len²` causal mask on *every*
+/// call. For an N-token completion that is N redundant full-model uploads,
+/// even though the weights never change during inference.
+///
+/// `InferenceSession` uploads the weights once, precomputes the RoPE/mask
+/// tables once, and reuses them for every step — the inference-side analogue
+/// of the speedup `TrainerSession` already brought to training.
+pub struct InferenceSession<B: Backend> {
+    net: BurnTransformer<B>,
+    cfg: TransformerConfig,
+    device: B::Device,
+    seq_len: usize,
+    cos: BT<B, 2>,
+    sin: BT<B, 2>,
+    mask: BT<B, 2, burn::tensor::Bool>,
+}
+
+impl<B: Backend> InferenceSession<B> {
+    /// Upload the model to `device` once and precompute the RoPE/mask tables
+    /// for sequences of exactly `seq_len` tokens.
+    pub fn new(model: &TransformerModel, seq_len: usize, device: B::Device) -> Self {
+        let cfg = model.config.clone();
+        let net = BurnTransformer::<B>::from_model(model, &device);
+        let head_dim = cfg.n_embd / cfg.n_heads;
+        let (cos, sin) = rope_tables::<B>(seq_len, head_dim, cfg.rope_theta, &device);
+        let mask = causal_mask::<B>(seq_len, &device);
+        Self { net, cfg, device, seq_len, cos, sin, mask }
+    }
+
+    fn run(&self, tokens: &[u32]) -> BT<B, 3> {
+        debug_assert_eq!(tokens.len(), self.seq_len,
+            "InferenceSession expects exactly seq_len tokens");
+        let input_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+        let x = BT::<B, 2, Int>::from_data(
+            TensorData::new(input_i64, [1, self.seq_len]),
+            &self.device,
+        );
+        self.net.forward(x, &self.cfg, &self.cos, &self.sin, &self.mask) // (1, T, vocab)
+    }
+
+    /// Logits at every position of a `seq_len`-length sequence. Returns a Vec
+    /// of length `seq_len * vocab_size`, row-major.
+    pub fn forward_logits(&self, tokens: &[u32]) -> Vec<f32> {
+        let logits = self.run(tokens);
+        let logits = logits.reshape([self.seq_len * self.cfg.vocab_size]);
+        logits.into_data().convert::<f32>().into_vec().unwrap()
+    }
+
+    /// Logits at the **final** position only — the single row generation
+    /// samples from. We slice it off on-device so only `vocab_size` floats
+    /// cross the GPU→CPU boundary instead of `seq_len * vocab_size`.
+    pub fn forward_logits_last(&self, tokens: &[u32]) -> Vec<f32> {
+        let vocab = self.cfg.vocab_size;
+        let logits = self.run(tokens); // (1, seq_len, vocab)
+        let last = logits
+            .slice([0..1, self.seq_len - 1..self.seq_len, 0..vocab])
+            .reshape([vocab]);
+        last.into_data().convert::<f32>().into_vec().unwrap()
+    }
+}
+
 // ─── CPU inference ──────────────────────────────────────────────────────────
 
 /// Compute logits at every position for a (single) sequence of `tokens`.
 /// Returns a Vec of length `tokens.len() * vocab_size`, row-major.
 /// We run through Burn on the requested backend rather than reimplementing
 /// the forward pass — this keeps inference and training byte-identical.
+///
+/// For autoregressive generation (many forward passes over the same weights),
+/// build an [`InferenceSession`] instead so the weights are uploaded once.
 pub fn forward_logits<B: Backend>(
     model: &TransformerModel,
     tokens: &[u32],
     device: &B::Device,
 ) -> Vec<f32> {
-    let net: BurnTransformer<B> = BurnTransformer::from_model(model, device);
-    let seq_len = tokens.len();
-    let input_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
-    let x = BT::<B, 2, Int>::from_data(
-        TensorData::new(input_i64, [1, seq_len]),
-        device,
-    );
-    let head_dim = model.config.n_embd / model.config.n_heads;
-    let (cos, sin) = rope_tables::<B>(seq_len, head_dim, model.config.rope_theta, device);
-    let mask = causal_mask::<B>(seq_len, device);
-    let logits = net.forward(x, &model.config, &cos, &sin, &mask); // (1, T, vocab)
-    let logits = logits.reshape([seq_len * model.config.vocab_size]);
-    logits.into_data().convert::<f32>().into_vec().unwrap()
+    InferenceSession::<B>::new(model, tokens.len(), device.clone())
+        .forward_logits(tokens)
 }
 
 #[cfg(test)]
@@ -756,6 +817,29 @@ mod tests {
         let logits = forward_logits::<CpuBackend>(&model, &tokens, &device);
         assert_eq!(logits.len(), 8 * 10);
         assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
+    /// The reusable `InferenceSession` must produce exactly the same logits as
+    /// the one-shot `forward_logits`, and `forward_logits_last` must equal the
+    /// final row of the full output (it just slices it off on-device).
+    #[test]
+    fn inference_session_matches_one_shot() {
+        let vocab = 10;
+        let cfg = tiny_config(vocab);
+        let model = TransformerModel::new(cfg.clone(), 7);
+        let device = <CpuBackend as Backend>::Device::default();
+        let tokens: Vec<u32> = vec![3, 1, 4, 1, 5, 9, 2, 6];
+
+        let one_shot = forward_logits::<CpuBackend>(&model, &tokens, &device);
+        let session = InferenceSession::<CpuBackend>::new(&model, tokens.len(), device);
+
+        let all = session.forward_logits(&tokens);
+        assert_eq!(all, one_shot, "session full logits differ from forward_logits");
+
+        let last = session.forward_logits_last(&tokens);
+        assert_eq!(last.len(), vocab);
+        let expected_last = &one_shot[one_shot.len() - vocab..];
+        assert_eq!(last.as_slice(), expected_last, "last-row slice differs from full logits");
     }
 
     /// Train on a trivial deterministic sequence and check that the loss
