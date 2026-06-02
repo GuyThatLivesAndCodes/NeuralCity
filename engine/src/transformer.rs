@@ -157,16 +157,12 @@ impl<B: Backend> BurnTransformer<B> {
         Self { token_embd, blocks, output_norm, output }
     }
 
-    /// Forward pass.
-    /// - `tokens`: (batch, seq_len) Int tensor
-    /// - `cos`, `sin`: precomputed RoPE tables (T, head_dim/2)
-    /// - `mask`: precomputed causal mask (T, T)
-    /// - returns logits: (batch, seq_len, vocab)
-    ///
-    /// Passing the tables in (rather than rebuilding them every call) is what
-    /// the `TrainerSession` uses to avoid rebuilding ~seq_len² booleans plus
-    /// the trig tables on every training step.
-    fn forward(
+    /// Run the transformer trunk and return the post-final-norm hidden states
+    /// `(batch, seq_len, n_embd)` — i.e. everything up to but excluding the LM
+    /// head projection. Both `forward` (all positions) and `forward_last`
+    /// (generation, last position only) build on this so the expensive
+    /// attention/FFN stack is written exactly once.
+    fn hidden(
         &self,
         tokens: BT<B, 2, Int>,
         cfg: &TransformerConfig,
@@ -231,12 +227,52 @@ impl<B: Backend> BurnTransformer<B> {
             h = h + ff_out;
         }
 
-        // Final norm + LM head.
-        let h = rmsnorm::<B>(&h, &self.output_norm.val(), cfg.rms_eps);
-        let bt = batch * seq_len;
-        let h_2d: BT<B, 2> = h.reshape([bt, n_embd]);
+        // Final norm — caller applies the LM head.
+        rmsnorm::<B>(&h, &self.output_norm.val(), cfg.rms_eps)
+    }
+
+    /// Forward pass returning logits at every position: `(batch, seq_len, vocab)`.
+    /// Used by training (cross-entropy over all positions) and `forward_logits`.
+    ///
+    /// Passing the tables in (rather than rebuilding them every call) is what
+    /// the `TrainerSession` uses to avoid rebuilding ~seq_len² booleans plus
+    /// the trig tables on every training step.
+    fn forward(
+        &self,
+        tokens: BT<B, 2, Int>,
+        cfg: &TransformerConfig,
+        cos: &BT<B, 2>,
+        sin: &BT<B, 2>,
+        mask: &BT<B, 2, burn::tensor::Bool>,
+    ) -> BT<B, 3> {
+        let h = self.hidden(tokens, cfg, cos, sin, mask);
+        let [batch, seq_len, n_embd] = h.dims();
+        let h_2d: BT<B, 2> = h.reshape([batch * seq_len, n_embd]);
         let logits_2d = h_2d.matmul(self.output.val());
         logits_2d.reshape([batch, seq_len, cfg.vocab_size])
+    }
+
+    /// Forward pass returning logits for the **last position only**: `(vocab,)`.
+    /// Autoregressive generation only ever consumes the final row, so we slice
+    /// the hidden state down to one position before the LM head — saving a
+    /// `(seq_len-1) × n_embd × vocab` matmul per generated token. Assumes a
+    /// single sequence (`batch == 1`), which is how generation drives it.
+    fn forward_last(
+        &self,
+        tokens: BT<B, 2, Int>,
+        cfg: &TransformerConfig,
+        cos: &BT<B, 2>,
+        sin: &BT<B, 2>,
+        mask: &BT<B, 2, burn::tensor::Bool>,
+    ) -> BT<B, 1> {
+        let h = self.hidden(tokens, cfg, cos, sin, mask);
+        let [batch, seq_len, n_embd] = h.dims();
+        // Keep only the final position: (batch, 1, n_embd) -> (batch, n_embd).
+        let last: BT<B, 2> = h
+            .slice([0..batch, seq_len - 1..seq_len, 0..n_embd])
+            .reshape([batch, n_embd]);
+        let logits = last.matmul(self.output.val()); // (batch, vocab)
+        logits.reshape([batch * cfg.vocab_size])
     }
 
     fn write_back(self, model: &mut TransformerModel) {
@@ -726,6 +762,62 @@ pub fn forward_logits<B: Backend>(
     logits.into_data().convert::<f32>().into_vec().unwrap()
 }
 
+/// A long-lived inference session for autoregressive generation.
+///
+/// The previous generation path called [`forward_logits`] once per generated
+/// token, and each call rebuilt the entire Burn module from the CPU
+/// `TransformerModel` — re-uploading every weight tensor to the GPU — plus
+/// rebuilt the RoPE trig tables and the `seq_len²` causal mask, and projected
+/// the LM head over *all* positions only to throw away every row but the last.
+///
+/// `InferenceSession` uploads the weights once, caches the RoPE/mask tables
+/// (rebuilding only when the sequence length changes), and projects the LM
+/// head for the final position alone. For a model with millions of parameters
+/// generating tens of tokens this removes the dominant per-token cost.
+/// Cached per-length forward tables: `(seq_len, cos, sin, causal mask)`.
+type RopeMaskCache<B> = (usize, BT<B, 2>, BT<B, 2>, BT<B, 2, burn::tensor::Bool>);
+
+pub struct InferenceSession<B: Backend> {
+    net: BurnTransformer<B>,
+    cfg: TransformerConfig,
+    device: B::Device,
+    head_dim: usize,
+    /// Cached RoPE/mask tables; rebuilt only when `seq_len` changes.
+    cached: Option<RopeMaskCache<B>>,
+}
+
+impl<B: Backend> InferenceSession<B> {
+    /// Upload the model to `device` once. Reuse the returned session for every
+    /// token of a generation run.
+    pub fn new(model: &TransformerModel, device: B::Device) -> Self {
+        let net = BurnTransformer::<B>::from_model(model, &device);
+        let cfg = model.config.clone();
+        let head_dim = cfg.n_embd / cfg.n_heads;
+        Self { net, cfg, device, head_dim, cached: None }
+    }
+
+    /// Logits for the next token given `tokens` (a single sequence). Returns a
+    /// `vocab_size`-length row. The RoPE/mask tables are reused across calls
+    /// with the same length — generation typically feeds a fixed-width window,
+    /// so they are built once.
+    pub fn next_logits(&mut self, tokens: &[u32]) -> Vec<f32> {
+        let seq_len = tokens.len();
+        let need_rebuild = !matches!(&self.cached, Some((s, ..)) if *s == seq_len);
+        if need_rebuild {
+            let (cos, sin) =
+                rope_tables::<B>(seq_len, self.head_dim, self.cfg.rope_theta, &self.device);
+            let mask = causal_mask::<B>(seq_len, &self.device);
+            self.cached = Some((seq_len, cos, sin, mask));
+        }
+        let (_, cos, sin, mask) = self.cached.as_ref().unwrap();
+
+        let input_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+        let x = BT::<B, 2, Int>::from_data(TensorData::new(input_i64, [1, seq_len]), &self.device);
+        let logits = self.net.forward_last(x, &self.cfg, cos, sin, mask); // (vocab,)
+        logits.into_data().convert::<f32>().into_vec().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +848,37 @@ mod tests {
         let logits = forward_logits::<CpuBackend>(&model, &tokens, &device);
         assert_eq!(logits.len(), 8 * 10);
         assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
+    /// The session's last-position logits must match the last row of the full
+    /// `forward_logits` output — the LM-head slice is an optimization, not a
+    /// behavior change.
+    #[test]
+    fn inference_session_matches_full_forward() {
+        let cfg = tiny_config(10);
+        let model = TransformerModel::new(cfg.clone(), 7);
+        let device = <CpuBackend as Backend>::Device::default();
+        let tokens: Vec<u32> = vec![3, 1, 4, 1, 5, 9, 2, 6];
+
+        let full = forward_logits::<CpuBackend>(&model, &tokens, &device);
+        let last_row = &full[full.len() - cfg.vocab_size..];
+
+        let mut session = InferenceSession::<CpuBackend>::new(&model, device);
+        let row = session.next_logits(&tokens);
+        assert_eq!(row.len(), cfg.vocab_size);
+        for (a, b) in row.iter().zip(last_row.iter()) {
+            assert!((a - b).abs() < 1e-4, "logit mismatch: {a} vs {b}");
+        }
+
+        // A second call with a different length must rebuild tables and still
+        // agree with the full forward for that length.
+        let short: Vec<u32> = vec![2, 7, 1, 8];
+        let full2 = forward_logits::<CpuBackend>(&model, &short, &device);
+        let last2 = &full2[full2.len() - cfg.vocab_size..];
+        let row2 = session.next_logits(&short);
+        for (a, b) in row2.iter().zip(last2.iter()) {
+            assert!((a - b).abs() < 1e-4, "logit mismatch after relen: {a} vs {b}");
+        }
     }
 
     /// Train on a trivial deterministic sequence and check that the loss
