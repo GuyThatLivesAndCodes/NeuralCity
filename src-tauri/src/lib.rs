@@ -2036,6 +2036,19 @@ async fn infer_transformer(
         let mut rng = SplitMix64::new(0xDEAD_BEEF_u64 ^ (max_new as u64).wrapping_mul(0x9E3779B1));
         let device = neuralcabin_engine::default_gpu_device();
 
+        // Build the inference session once: upload the weights to the device,
+        // precompute the RoPE/causal-mask tables for the fixed `n_ctx` window.
+        // The generation loop below feeds a constant-width window every step,
+        // so all of that is identical token-to-token — rebuilding it each step
+        // (the old `forward_logits` path) re-uploaded every weight to the GPU
+        // per token, which dominated generation latency.
+        let session = {
+            let model = model_arc.read().await;
+            neuralcabin_engine::transformer::InferenceSession::<
+                neuralcabin_engine::GpuBackend,
+            >::new(&model, n_ctx, device)
+        };
+
         for index in 0..max_new {
             if cancel.load(Ordering::Relaxed) {
                 let _ = app_clone.emit("inference_finished", InferenceFinished {
@@ -2047,23 +2060,16 @@ async fn infer_transformer(
                 break;
             }
             // Take the last n_ctx tokens; pad-left with EOS if shorter.
-            let mut window: Vec<u32> = if ids.len() >= n_ctx {
+            let window: Vec<u32> = if ids.len() >= n_ctx {
                 ids[ids.len() - n_ctx..].to_vec()
             } else {
                 let mut w = vec![EOS_ID; n_ctx - ids.len()];
                 w.extend_from_slice(&ids);
                 w
             };
-            // forward returns logits for every position; we want the LAST one.
-            let model = model_arc.read().await;
-            let logits = neuralcabin_engine::transformer::forward_logits::<
-                neuralcabin_engine::GpuBackend,
-            >(&model, &window, &device);
-            drop(model);
-            let vocab_sz = vocab.size();
-            let last_row = &logits[logits.len() - vocab_sz..];
-            // softmax for sampling.
-            let mut row = last_row.to_vec();
+            // The session holds the device-resident weights; ask it for just
+            // the final position's logits (a single `vocab` row off the GPU).
+            let mut row = session.forward_last(&window);
             let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             for v in row.iter_mut() { *v = (*v - mx).exp(); }
             let s: f32 = row.iter().sum();
@@ -2084,9 +2090,6 @@ async fn infer_transformer(
             });
             if (chosen as u32) == EOS_ID { break; }
             ids.push(chosen as u32);
-            // Suppress unused warning while we keep the variable for future
-            // KV-cache work — the window is recomputed every step today.
-            let _ = &mut window;
             tokio::task::yield_now().await;
         }
         let _ = app_clone.emit("inference_finished", InferenceFinished {

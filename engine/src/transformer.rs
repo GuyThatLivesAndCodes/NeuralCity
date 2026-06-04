@@ -726,6 +726,71 @@ pub fn forward_logits<B: Backend>(
     logits.into_data().convert::<f32>().into_vec().unwrap()
 }
 
+/// A long-lived inference session for autoregressive generation.
+///
+/// Token-by-token generation feeds the model a fixed-width context window
+/// (`seq_len`, left-padded) at every step and only ever reads the logits of
+/// the *last* position. The naive path (`forward_logits`) rebuilt the Burn
+/// module from the CPU `TransformerModel` on every single token — re-uploading
+/// every weight to the device — and also rebuilt the RoPE tables and the
+/// `seq_len²` causal mask each call, then pulled back logits for *all*
+/// positions when only the final row is used.
+///
+/// This session uploads the weights once, precomputes the RoPE/mask tables
+/// once (they're identical every step because the window width is fixed), and
+/// returns only the final-position logits. It mirrors the
+/// [`TrainerSession`] optimization on the training side.
+pub struct InferenceSession<B: Backend> {
+    net: BurnTransformer<B>,
+    cfg: TransformerConfig,
+    device: B::Device,
+    seq_len: usize,
+    cos: BT<B, 2>,
+    sin: BT<B, 2>,
+    mask: BT<B, 2, burn::tensor::Bool>,
+}
+
+impl<B: Backend> InferenceSession<B> {
+    /// Build a session for generating with a fixed context-window width
+    /// (`seq_len`). Uploads the model and precomputes the RoPE/mask tables
+    /// once.
+    pub fn new(model: &TransformerModel, seq_len: usize, device: B::Device) -> Self {
+        let cfg = model.config.clone();
+        let net = BurnTransformer::<B>::from_model(model, &device);
+        let head_dim = cfg.n_embd / cfg.n_heads;
+        let (cos, sin) = rope_tables::<B>(seq_len, head_dim, cfg.rope_theta, &device);
+        let mask = causal_mask::<B>(seq_len, &device);
+        Self { net, cfg, device, seq_len, cos, sin, mask }
+    }
+
+    /// The fixed context-window width this session was built for.
+    pub fn seq_len(&self) -> usize { self.seq_len }
+
+    /// Compute the logits for the *last* position of `tokens`, which must be
+    /// exactly `seq_len` long. Returns a Vec of length `vocab_size`.
+    pub fn forward_last(&self, tokens: &[u32]) -> Vec<f32> {
+        debug_assert_eq!(
+            tokens.len(),
+            self.seq_len,
+            "InferenceSession::forward_last expects exactly seq_len tokens",
+        );
+        let seq_len = self.seq_len;
+        let vocab = self.cfg.vocab_size;
+        let input_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+        let x = BT::<B, 2, Int>::from_data(
+            TensorData::new(input_i64, [1, seq_len]),
+            &self.device,
+        );
+        let logits = self.net.forward(x, &self.cfg, &self.cos, &self.sin, &self.mask); // (1, T, vocab)
+        // Keep only the final position's row before pulling off the device, so
+        // the GPU→CPU transfer is `vocab` floats instead of `seq_len * vocab`.
+        let last = logits
+            .slice([0..1, (seq_len - 1)..seq_len, 0..vocab])
+            .reshape([vocab]);
+        last.into_data().convert::<f32>().into_vec().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +821,30 @@ mod tests {
         let logits = forward_logits::<CpuBackend>(&model, &tokens, &device);
         assert_eq!(logits.len(), 8 * 10);
         assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
+    /// The fixed-window `InferenceSession` must produce exactly the same
+    /// last-position logits as the one-shot `forward_logits` path it replaces.
+    /// This locks in the optimization (build module + RoPE/mask once, return
+    /// only the final row) as behaviour-preserving.
+    #[test]
+    fn inference_session_matches_forward_logits() {
+        let cfg = tiny_config(10);
+        let model = TransformerModel::new(cfg.clone(), 7);
+        let device = <CpuBackend as Backend>::Device::default();
+        let tokens: Vec<u32> = (0..8).map(|i| i % 10).collect();
+
+        let full = forward_logits::<CpuBackend>(&model, &tokens, &device);
+        let vocab = cfg.vocab_size;
+        let reference_last = &full[full.len() - vocab..];
+
+        let session = InferenceSession::<CpuBackend>::new(&model, tokens.len(), device);
+        let session_last = session.forward_last(&tokens);
+
+        assert_eq!(session_last.len(), vocab);
+        for (a, b) in session_last.iter().zip(reference_last.iter()) {
+            assert!((a - b).abs() < 1e-4, "logits differ: {a} vs {b}");
+        }
     }
 
     /// Train on a trivial deterministic sequence and check that the loss
