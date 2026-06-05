@@ -706,6 +706,11 @@ fn build_opt<B: AutodiffBackend>(
 /// Returns a Vec of length `tokens.len() * vocab_size`, row-major.
 /// We run through Burn on the requested backend rather than reimplementing
 /// the forward pass — this keeps inference and training byte-identical.
+///
+/// This rebuilds the Burn module and the RoPE/mask tables on every call, so
+/// it is only appropriate for one-shot use. Autoregressive generation should
+/// use [`InferenceSession`], which uploads the weights and builds the tables
+/// once and reuses them across every generated token.
 pub fn forward_logits<B: Backend>(
     model: &TransformerModel,
     tokens: &[u32],
@@ -726,6 +731,78 @@ pub fn forward_logits<B: Backend>(
     logits.into_data().convert::<f32>().into_vec().unwrap()
 }
 
+/// A long-lived inference session for autoregressive generation.
+///
+/// Building this uploads every weight tensor to the device, and precomputes
+/// the RoPE cos/sin tables and the causal mask for `max_seq_len`, **once**.
+/// Each [`logits_last`](InferenceSession::logits_last) call then reuses all of
+/// that, in contrast to [`forward_logits`], which rebuilt the entire module
+/// and both tables on every call.
+///
+/// The previous generation loop called `forward_logits` per generated token,
+/// so for `N` new tokens it re-uploaded the full model `N` times, rebuilt the
+/// `seq_len²` causal mask and trig tables `N` times, and copied the full
+/// `seq_len × vocab` logits matrix back from the device `N` times even though
+/// only the final row is ever used. This session removes all of that
+/// per-token overhead while keeping the forward pass byte-identical.
+pub struct InferenceSession<B: Backend> {
+    net: BurnTransformer<B>,
+    cfg: TransformerConfig,
+    device: B::Device,
+    max_seq_len: usize,
+    cos: BT<B, 2>,
+    sin: BT<B, 2>,
+    mask: BT<B, 2, burn::tensor::Bool>,
+}
+
+impl<B: Backend> InferenceSession<B> {
+    /// Build a session: upload the model and precompute RoPE/mask tables for
+    /// sequences up to `max_seq_len` (typically the model's `n_ctx`).
+    pub fn new(model: &TransformerModel, max_seq_len: usize, device: B::Device) -> Self {
+        let cfg = model.config.clone();
+        let net = BurnTransformer::<B>::from_model(model, &device);
+        let head_dim = cfg.n_embd / cfg.n_heads;
+        let (cos, sin) = rope_tables::<B>(max_seq_len, head_dim, cfg.rope_theta, &device);
+        let mask = causal_mask::<B>(max_seq_len, &device);
+        Self { net, cfg, device, max_seq_len, cos, sin, mask }
+    }
+
+    /// Logits for the **last** position of `tokens`. Returns a `Vec` of length
+    /// `vocab_size`. Only that final row is copied back from the device, so the
+    /// GPU→CPU transfer is `vocab` floats rather than `seq_len × vocab`.
+    pub fn logits_last(&self, tokens: &[u32]) -> Vec<f32> {
+        let seq_len = tokens.len();
+        assert!(
+            seq_len > 0 && seq_len <= self.max_seq_len,
+            "sequence length {seq_len} out of range (1..={})",
+            self.max_seq_len,
+        );
+        let input_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+        let x = BT::<B, 2, Int>::from_data(
+            TensorData::new(input_i64, [1, seq_len]),
+            &self.device,
+        );
+
+        // Reuse the precomputed tables directly when the window fills the whole
+        // context (the common case); otherwise slice to the actual length.
+        let logits = if seq_len == self.max_seq_len {
+            self.net.forward(x, &self.cfg, &self.cos, &self.sin, &self.mask)
+        } else {
+            let half = self.cos.dims()[1];
+            let cos = self.cos.clone().slice([0..seq_len, 0..half]);
+            let sin = self.sin.clone().slice([0..seq_len, 0..half]);
+            let mask = self.mask.clone().slice([0..seq_len, 0..seq_len]);
+            self.net.forward(x, &self.cfg, &cos, &sin, &mask)
+        }; // (1, T, vocab)
+
+        let vocab = self.cfg.vocab_size;
+        let last = logits
+            .slice([0..1, seq_len - 1..seq_len, 0..vocab])
+            .reshape([vocab]);
+        last.into_data().convert::<f32>().into_vec().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,6 +821,29 @@ mod tests {
             n_ff: 32,
             rope_theta: 10000.0,
             rms_eps: 1e-5,
+        }
+    }
+
+    /// The reusable `InferenceSession` must return exactly the same last-row
+    /// logits as a fresh `forward_logits` call — the optimization may not
+    /// change the math. Checks both the full-context window and a shorter one
+    /// (which exercises the table-slicing path).
+    #[test]
+    fn inference_session_matches_forward_logits() {
+        let cfg = tiny_config(10);
+        let model = TransformerModel::new(cfg.clone(), 7);
+        let device = <CpuBackend as Backend>::Device::default();
+        let session = InferenceSession::<CpuBackend>::new(&model, cfg.n_ctx, device.clone());
+
+        for len in [cfg.n_ctx, cfg.n_ctx / 2, 1] {
+            let tokens: Vec<u32> = (0..len as u32).map(|t| t % cfg.vocab_size as u32).collect();
+            let full = forward_logits::<CpuBackend>(&model, &tokens, &device);
+            let last_full = &full[full.len() - cfg.vocab_size..];
+            let last_session = session.logits_last(&tokens);
+            assert_eq!(last_session.len(), cfg.vocab_size);
+            for (a, b) in last_session.iter().zip(last_full.iter()) {
+                assert!((a - b).abs() < 1e-5, "mismatch at len {len}: {a} vs {b}");
+            }
         }
     }
 
