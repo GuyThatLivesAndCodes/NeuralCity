@@ -2046,19 +2046,29 @@ async fn infer_transformer(
                 });
                 break;
             }
-            // Take the last n_ctx tokens; pad-left with EOS if shorter.
-            let mut window: Vec<u32> = if ids.len() >= n_ctx {
-                ids[ids.len() - n_ctx..].to_vec()
+            // Transformers handle variable-length sequences natively, so feed
+            // only the real tokens (capped at the last n_ctx). Left-padding to
+            // n_ctx would (a) make every step pay the full O(n_ctx²) attention
+            // cost even for short sequences and (b) pollute attention: the
+            // causal mask suppresses *future* positions but not left-pad tokens,
+            // so real tokens would attend to spurious EOS pads the model never
+            // saw during training, degrading generation quality.
+            let window_storage: Vec<u32>;
+            let window: &[u32] = if ids.len() > n_ctx {
+                &ids[ids.len() - n_ctx..]
+            } else if ids.is_empty() {
+                // Degenerate empty-prompt case: seed with a single EOS so the
+                // forward pass has at least one position to attend to.
+                window_storage = vec![EOS_ID];
+                &window_storage
             } else {
-                let mut w = vec![EOS_ID; n_ctx - ids.len()];
-                w.extend_from_slice(&ids);
-                w
+                &ids
             };
             // forward returns logits for every position; we want the LAST one.
             let model = model_arc.read().await;
             let logits = neuralcabin_engine::transformer::forward_logits::<
                 neuralcabin_engine::GpuBackend,
-            >(&model, &window, &device);
+            >(&model, window, &device);
             drop(model);
             let vocab_sz = vocab.size();
             let last_row = &logits[logits.len() - vocab_sz..];
@@ -2084,9 +2094,6 @@ async fn infer_transformer(
             });
             if (chosen as u32) == EOS_ID { break; }
             ids.push(chosen as u32);
-            // Suppress unused warning while we keep the variable for future
-            // KV-cache work — the window is recomputed every step today.
-            let _ = &mut window;
             tokio::task::yield_now().await;
         }
         let _ = app_clone.emit("inference_finished", InferenceFinished {
