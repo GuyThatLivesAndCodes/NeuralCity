@@ -2046,13 +2046,20 @@ async fn infer_transformer(
                 });
                 break;
             }
-            // Take the last n_ctx tokens; pad-left with EOS if shorter.
-            let mut window: Vec<u32> = if ids.len() >= n_ctx {
+            // Context = the last n_ctx real tokens. The transformer forward
+            // handles variable-length sequences natively, so we pass exactly
+            // the real tokens with no left-padding. This keeps RoPE positions
+            // aligned with training (sequences always start at position 0),
+            // avoids polluting attention with leading EOS pad tokens, and —
+            // critically for speed — makes the forward pass cost scale with
+            // the actual prefix length instead of the full n_ctx every step.
+            let window: Vec<u32> = if ids.is_empty() {
+                // No prompt: seed generation with a single EOS as a BOS marker.
+                vec![EOS_ID]
+            } else if ids.len() > n_ctx {
                 ids[ids.len() - n_ctx..].to_vec()
             } else {
-                let mut w = vec![EOS_ID; n_ctx - ids.len()];
-                w.extend_from_slice(&ids);
-                w
+                ids.clone()
             };
             // forward returns logits for every position; we want the LAST one.
             let model = model_arc.read().await;
@@ -2084,9 +2091,6 @@ async fn infer_transformer(
             });
             if (chosen as u32) == EOS_ID { break; }
             ids.push(chosen as u32);
-            // Suppress unused warning while we keep the variable for future
-            // KV-cache work — the window is recomputed every step today.
-            let _ = &mut window;
             tokio::task::yield_now().await;
         }
         let _ = app_clone.emit("inference_finished", InferenceFinished {
