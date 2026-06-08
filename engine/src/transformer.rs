@@ -176,6 +176,50 @@ impl<B: Backend> BurnTransformer<B> {
     ) -> BT<B, 3> {
         let [batch, seq_len] = tokens.dims();
         let n_embd = cfg.n_embd;
+        // Hidden states after the final RMSNorm: (B, T, n_embd).
+        let h = self.hidden(tokens, cfg, cos, sin, mask);
+        // LM head over every position.
+        let bt = batch * seq_len;
+        let h_2d: BT<B, 2> = h.reshape([bt, n_embd]);
+        let logits_2d = h_2d.matmul(self.output.val());
+        logits_2d.reshape([batch, seq_len, cfg.vocab_size])
+    }
+
+    /// Forward pass that projects only the final position through the LM head.
+    /// Autoregressive generation samples just the last token, so computing
+    /// logits for the other `seq_len - 1` positions — and shipping them back
+    /// off the device — is pure waste. Returns logits of shape (batch, vocab).
+    fn forward_last(
+        &self,
+        tokens: BT<B, 2, Int>,
+        cfg: &TransformerConfig,
+        cos: &BT<B, 2>,
+        sin: &BT<B, 2>,
+        mask: &BT<B, 2, burn::tensor::Bool>,
+    ) -> BT<B, 2> {
+        let [batch, seq_len] = tokens.dims();
+        let n_embd = cfg.n_embd;
+        let h = self.hidden(tokens, cfg, cos, sin, mask); // (B, T, n_embd)
+        // Keep only the last time step: (B, 1, n_embd) -> (B, n_embd).
+        let last: BT<B, 3> = h.slice([0..batch, (seq_len - 1)..seq_len, 0..n_embd]);
+        let last_2d: BT<B, 2> = last.reshape([batch, n_embd]);
+        last_2d.matmul(self.output.val()) // (B, vocab)
+    }
+
+    /// Shared trunk: embedding lookup, transformer blocks, and the final
+    /// RMSNorm. Returns hidden states of shape (B, T, n_embd) ready for the LM
+    /// head. Both `forward` and `forward_last` build on this so the two paths
+    /// stay byte-identical up to the output projection.
+    fn hidden(
+        &self,
+        tokens: BT<B, 2, Int>,
+        cfg: &TransformerConfig,
+        cos: &BT<B, 2>,
+        sin: &BT<B, 2>,
+        mask: &BT<B, 2, burn::tensor::Bool>,
+    ) -> BT<B, 3> {
+        let [batch, seq_len] = tokens.dims();
+        let n_embd = cfg.n_embd;
         let n_heads = cfg.n_heads;
         let head_dim = n_embd / n_heads;
 
@@ -231,12 +275,9 @@ impl<B: Backend> BurnTransformer<B> {
             h = h + ff_out;
         }
 
-        // Final norm + LM head.
-        let h = rmsnorm::<B>(&h, &self.output_norm.val(), cfg.rms_eps);
-        let bt = batch * seq_len;
-        let h_2d: BT<B, 2> = h.reshape([bt, n_embd]);
-        let logits_2d = h_2d.matmul(self.output.val());
-        logits_2d.reshape([batch, seq_len, cfg.vocab_size])
+        // Final norm. The LM head is applied by the caller so inference can
+        // project only the last position.
+        rmsnorm::<B>(&h, &self.output_norm.val(), cfg.rms_eps)
     }
 
     fn write_back(self, model: &mut TransformerModel) {
@@ -697,6 +738,60 @@ fn build_opt<B: AutodiffBackend>(
                 .with_weight_decay(weight_decay);
             (OptVariant::AdamW(cfg.init::<B, BurnTransformer<B>>()), lr as f64)
         }
+    }
+}
+
+// ─── Inference session ───────────────────────────────────────────────────────
+
+/// A long-lived inference session for autoregressive generation.
+///
+/// `forward_logits` rebuilt the whole Burn module from the CPU `Tensor`
+/// weights — re-uploading *every* parameter to the device — and re-filled the
+/// RoPE trig tables plus the seq_len² causal mask on every single generated
+/// token. For a 64-token completion that is 64 full weight uploads and 64 mask
+/// rebuilds. This session does that work once: the module stays resident on
+/// the device and the RoPE/mask tensors are reused across the whole run.
+///
+/// It also projects only the final position through the LM head (generation
+/// samples just the last token), avoiding the (seq_len − 1)×vocab logits that
+/// `forward_logits` computed and copied back off the device every step.
+pub struct InferenceSession<B: Backend> {
+    net: BurnTransformer<B>,
+    cfg: TransformerConfig,
+    device: B::Device,
+    seq_len: usize,
+    cos: BT<B, 2>,
+    sin: BT<B, 2>,
+    mask: BT<B, 2, burn::tensor::Bool>,
+}
+
+impl<B: Backend> InferenceSession<B> {
+    /// Upload the model once and precompute the RoPE/mask tensors for a fixed
+    /// window length. Every `forward_last` call must pass exactly `seq_len`
+    /// tokens (the inference loop left-pads short prompts to the context size).
+    pub fn new(model: &TransformerModel, seq_len: usize, device: B::Device) -> Self {
+        let cfg = model.config.clone();
+        let net = BurnTransformer::<B>::from_model(model, &device);
+        let head_dim = cfg.n_embd / cfg.n_heads;
+        let (cos, sin) = rope_tables::<B>(seq_len, head_dim, cfg.rope_theta, &device);
+        let mask = causal_mask::<B>(seq_len, &device);
+        Self { net, cfg, device, seq_len, cos, sin, mask }
+    }
+
+    /// The fixed window length this session was built for.
+    pub fn seq_len(&self) -> usize { self.seq_len }
+
+    /// Logits for the final position of `tokens` (length must equal
+    /// `seq_len`). Returns a `vocab_size`-long row.
+    pub fn forward_last(&self, tokens: &[u32]) -> Vec<f32> {
+        debug_assert_eq!(tokens.len(), self.seq_len, "forward_last expects a full window");
+        let input_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+        let x = BT::<B, 2, Int>::from_data(
+            TensorData::new(input_i64, [1, self.seq_len]),
+            &self.device,
+        );
+        let logits = self.net.forward_last(x, &self.cfg, &self.cos, &self.sin, &self.mask);
+        logits.into_data().convert::<f32>().into_vec().unwrap()
     }
 }
 
