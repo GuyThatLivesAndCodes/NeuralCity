@@ -74,9 +74,16 @@ pub fn build_finetuning_tensors(
 ) -> Option<(Tensor, Tensor)> {
     assert!(context_size > 0, "context_size must be positive");
     let v = vocab.size();
-    let mut x_rows: Vec<Vec<f32>> = Vec::new();
-    let mut y_rows: Vec<u32> = Vec::new();
 
+    // Encode every pair into a token-id sequence once, recording where the
+    // assistant region begins (for masking). We keep only the compact `u32`
+    // ids here — not the expanded one-hot rows — so peak memory is a single
+    // contiguous output buffer instead of a `Vec<Vec<f32>>` of one-hot rows
+    // *plus* a flattened copy of it. The one-hot expansion (the dominant
+    // allocation: `n * context_size * vocab_size` f32s) now happens exactly
+    // once, written straight into the final buffer.
+    let mut seqs: Vec<(Vec<u32>, usize)> = Vec::with_capacity(pairs.len());
+    let mut n = 0_usize;
     for pair in pairs {
         let mut seq: Vec<u32> = Vec::new();
         seq.push(USER_ID);
@@ -90,36 +97,41 @@ pub fn build_finetuning_tensors(
         if seq.len() < 2 { continue; }
 
         for i in 0..(seq.len() - 1) {
-            let target = seq[i + 1];
             if mask_user_tokens && (i + 1) < output_start { continue; }
+            n += 1;
+        }
+        seqs.push((seq, output_start));
+    }
 
-            // Build context: last `context_size` tokens up to and including `i`,
-            // left-padded with PAD if shorter.
-            let mut window = vec![0.0_f32; context_size * v];
+    if n == 0 { return None; }
+
+    let row_stride = context_size * v;
+    let mut x_flat = vec![0.0_f32; n * row_stride];
+    let mut y_flat = vec![0.0_f32; n * v];
+    let mut ex = 0_usize;
+    for (seq, output_start) in &seqs {
+        for i in 0..(seq.len() - 1) {
+            let target = seq[i + 1];
+            if mask_user_tokens && (i + 1) < *output_start { continue; }
+
+            // Build context directly into the output row: last `context_size`
+            // tokens up to and including `i`, left-padded with PAD if shorter.
+            let base = ex * row_stride;
             let start = (i + 1).saturating_sub(context_size);
             let prefix_len = (i + 1) - start;
             let pad_len = context_size - prefix_len;
             for p in 0..pad_len {
-                window[p * v + PAD_ID as usize] = 1.0;
+                x_flat[base + p * v + PAD_ID as usize] = 1.0;
             }
             for (offset, &tok) in seq[start..=i].iter().enumerate() {
                 let pos = pad_len + offset;
-                window[pos * v + tok as usize] = 1.0;
+                x_flat[base + pos * v + tok as usize] = 1.0;
             }
-            x_rows.push(window);
-            y_rows.push(target);
+            y_flat[ex * v + target as usize] = 1.0;
+            ex += 1;
         }
     }
-
-    if x_rows.is_empty() { return None; }
-
-    let n = x_rows.len();
-    let mut x_flat = Vec::with_capacity(n * context_size * v);
-    for row in &x_rows { x_flat.extend_from_slice(row); }
-    let mut y_flat = vec![0.0_f32; n * v];
-    for (i, &t) in y_rows.iter().enumerate() {
-        y_flat[i * v + t as usize] = 1.0;
-    }
+    debug_assert_eq!(ex, n, "emitted example count must match the counting pass");
 
     Some((
         Tensor::new(vec![n, context_size * v], x_flat),
@@ -190,6 +202,52 @@ mod tests {
         let pairs = vec![Pair { input: "hi".into(), output: "y".into() }];
         let (x, _) = build_finetuning_tensors(&pairs, &vocab, 3, true).unwrap();
         assert_eq!(x.rows(), 2);
+    }
+
+    #[test]
+    fn finetuning_rows_are_correct_onehot() {
+        // Lock in the exact one-hot content of each emitted row so the
+        // in-place fill stays byte-identical to a row-by-row construction.
+        let vocab = char_vocab("hi y");
+        let v = vocab.size();
+        let pairs = vec![Pair { input: "hi".into(), output: "y".into() }];
+        let context_size = 3;
+        let (x, y) = build_finetuning_tensors(&pairs, &vocab, context_size, true).unwrap();
+
+        // Reconstruct the expected sequence: <user> h i <eos> <assistant> y <eos>
+        let mut seq: Vec<u32> = vec![USER_ID];
+        seq.extend(vocab.encode("hi"));
+        seq.push(EOS_ID);
+        seq.push(ASSISTANT_ID);
+        let output_start = seq.len();
+        seq.extend(vocab.encode("y"));
+        seq.push(EOS_ID);
+
+        // Re-derive expected rows independently (the original algorithm).
+        let mut expected_x: Vec<f32> = Vec::new();
+        let mut expected_y: Vec<f32> = Vec::new();
+        for i in 0..(seq.len() - 1) {
+            let target = seq[i + 1];
+            if (i + 1) < output_start { continue; }
+            let mut window = vec![0.0_f32; context_size * v];
+            let start = (i + 1).saturating_sub(context_size);
+            let pad_len = context_size - ((i + 1) - start);
+            for p in 0..pad_len { window[p * v + PAD_ID as usize] = 1.0; }
+            for (offset, &tok) in seq[start..=i].iter().enumerate() {
+                window[(pad_len + offset) * v + tok as usize] = 1.0;
+            }
+            expected_x.extend_from_slice(&window);
+            let mut yrow = vec![0.0_f32; v];
+            yrow[target as usize] = 1.0;
+            expected_y.extend_from_slice(&yrow);
+        }
+
+        assert_eq!(x.data, expected_x, "one-hot input rows diverged from reference");
+        assert_eq!(y.data, expected_y, "one-hot target rows diverged from reference");
+        // Every row is a clean concatenation of one-hots: exactly context_size
+        // ones per input row and exactly one per target row.
+        assert_eq!(x.data.iter().filter(|&&f| f == 1.0).count(), x.rows() * context_size);
+        assert_eq!(y.data.iter().filter(|&&f| f == 1.0).count(), y.rows());
     }
 
     #[test]
