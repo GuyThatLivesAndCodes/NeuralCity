@@ -45,6 +45,12 @@ pub struct AppState {
     /// Where to write `state.json`. None disables persistence — used by unit
     /// tests that don't go through the Tauri setup hook.
     pub(crate) data_dir:         Arc<RwLock<Option<PathBuf>>>,
+    /// Content signature of each weight file as it was last written to disk
+    /// (network id → `weights_signature()`). A full save only re-serializes and
+    /// rewrites models whose in-memory signature differs from this, so routine
+    /// metadata-only saves don't rewrite every large weight file. Entries are
+    /// dropped when a network is deleted (see `delete_network_internal`).
+    pub(crate) saved_sigs:       Arc<RwLock<HashMap<String, u64>>>,
 }
 
 #[derive(Clone)]
@@ -80,6 +86,7 @@ impl AppState {
             training_history: Arc::new(RwLock::new(HashMap::new())),
             servers:          Arc::new(RwLock::new(HashMap::new())),
             data_dir:         Arc::new(RwLock::new(None)),
+            saved_sigs:       Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -189,6 +196,10 @@ async fn get_or_load_model(
     };
     match persistence::load_model(&net.id, &data_dir).await {
         Ok(Some(model)) => {
+            // The just-loaded weights match the file on disk, so record their
+            // signature — a later save can then skip rewriting this model
+            // unless it's actually modified (e.g. by training).
+            state.saved_sigs.write().await.insert(net.id.clone(), model.weights_signature());
             let arc = Arc::new(RwLock::new(model));
             state.models.write().await.insert(net.id.clone(), arc.clone());
             Ok(arc)
@@ -211,6 +222,9 @@ async fn get_or_load_transformer(
     };
     match persistence::load_transformer(&net.id, &data_dir).await {
         Ok(Some(model)) => {
+            // Loaded weights match disk — record their signature so a later
+            // metadata save skips rewriting this transformer until it changes.
+            state.saved_sigs.write().await.insert(net.id.clone(), model.weights_signature());
             let arc = Arc::new(RwLock::new(model));
             state.transformers.write().await.insert(net.id.clone(), arc.clone());
             Ok(arc)
@@ -548,6 +562,10 @@ pub(crate) async fn delete_network_internal(app: &AppHandle, id: &str) -> Result
     state.vocabs.write().await.remove(id);
     state.corpora.write().await.remove(id);
     state.training_history.write().await.remove(id);
+    // Drop the cached weight signature so that a network later recreated under
+    // the same id (even with byte-identical weights) is written fresh rather
+    // than skipped against the deleted file's signature.
+    state.saved_sigs.write().await.remove(id);
     if let Some(dir) = persistence::data_dir(&state).await {
         if let Err(e) = persistence::delete_model(id, &dir).await {
             eprintln!("[neuralcabin] {e}");

@@ -88,6 +88,24 @@ impl Tensor {
     pub fn is_empty(&self) -> bool { self.data.is_empty() }
     pub fn rank(&self) -> usize { self.shape.len() }
 
+    /// Fold this tensor's shape and raw data into a running FNV-1a hash.
+    ///
+    /// Used to compute a cheap content signature for a whole model so the
+    /// persistence layer can skip re-serializing and rewriting weight files
+    /// that haven't changed since the last save. We hash the f32 *bit patterns*
+    /// (`to_bits`) rather than the values so the result is exact and stable
+    /// (two tensors hash equal iff their bytes are identical), and we never
+    /// touch the disk to decide whether a write is needed.
+    pub fn hash_into(&self, h: &mut u64) {
+        fnv_usize(h, self.shape.len());
+        for &d in &self.shape {
+            fnv_usize(h, d);
+        }
+        for &v in &self.data {
+            fnv_u32(h, v.to_bits());
+        }
+    }
+
     pub fn rows(&self) -> usize {
         debug_assert_eq!(self.shape.len(), 2, "rows() requires a 2-D tensor");
         self.shape[0]
@@ -273,6 +291,39 @@ impl Tensor {
             .expect("Burn tensor must be f32 to convert to neuralcabin Tensor");
         Tensor::new(vec![dims[0], dims[1]], values)
     }
+}
+
+// -------------------------------------------------------------------------------------
+// FNV-1a (64-bit) content hashing. Used to build a fast model "weights signature"
+// so the persistence layer can detect whether a model actually changed before
+// re-serializing and rewriting its (potentially large) weight file. FNV is a
+// few cheap integer ops per word — far less than JSON float formatting — and
+// pulls in no dependencies.
+// -------------------------------------------------------------------------------------
+
+/// FNV-1a 64-bit offset basis — the starting value for a fresh signature.
+pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[inline]
+pub fn fnv_u32(h: &mut u64, v: u32) {
+    // Mix the four bytes of `v` one at a time (canonical FNV-1a).
+    let mut x = v;
+    for _ in 0..4 {
+        *h = (*h ^ (x as u8 as u64)).wrapping_mul(FNV_PRIME);
+        x >>= 8;
+    }
+}
+
+#[inline]
+pub fn fnv_u64(h: &mut u64, v: u64) {
+    fnv_u32(h, v as u32);
+    fnv_u32(h, (v >> 32) as u32);
+}
+
+#[inline]
+pub fn fnv_usize(h: &mut u64, v: usize) {
+    fnv_u64(h, v as u64);
 }
 
 // -------------------------------------------------------------------------------------

@@ -200,30 +200,62 @@ pub async fn snapshot(state: &AppState) -> PersistedState {
 }
 
 /// Persist the full state: atomically replace `state.json` (no weights), then
-/// write a separate `models/<id>.json` for every model currently in memory.
+/// write a separate `models/<id>.json` for every model whose weights have
+/// changed since the last save.
+///
+/// Each model carries a cheap 64-bit content signature (`weights_signature()`).
+/// We compare the in-memory signature against the one recorded when the file
+/// was last written (`AppState.saved_sigs`) and skip the clone + JSON
+/// serialization + disk write entirely when they match. This keeps routine
+/// metadata-only saves (renaming a network, editing a corpus, changing a server
+/// setting) from rewriting every large weight file that happens to be resident
+/// in memory — the common cause of the "save takes forever" slowdown. The check
+/// is content-addressed, so any real weight change always produces a different
+/// signature and is always written; nothing is ever silently dropped.
 pub async fn save_to_dir(state: &AppState, data_dir: &Path) -> Result<(), String> {
     // 1. Write the metadata snapshot.
     let persisted = snapshot(state).await;
     save_persisted(&persisted, data_dir).await?;
 
-    // 2. Write each in-memory model to its own file. Non-fatal per model so
-    //    one corrupt model doesn't block saving everything else.
+    // 2. Write each changed in-memory model to its own file. Non-fatal per
+    //    model so one corrupt model doesn't block saving everything else.
     let models = state.models.read().await;
     for (id, model_arc) in models.iter() {
-        let model = model_arc.read().await.clone();
-        if let Err(e) = save_model(&model, id, data_dir).await {
-            eprintln!("[neuralcabin] {e}");
+        let (sig, model) = {
+            let guard = model_arc.read().await;
+            let sig = guard.weights_signature();
+            (sig, if needs_write(state, id, sig).await { Some(guard.clone()) } else { None })
+        };
+        if let Some(model) = model {
+            match save_model(&model, id, data_dir).await {
+                Ok(()) => { state.saved_sigs.write().await.insert(id.clone(), sig); }
+                Err(e) => eprintln!("[neuralcabin] {e}"),
+            }
         }
     }
     drop(models);
     let transformers = state.transformers.read().await;
     for (id, t_arc) in transformers.iter() {
-        let t = t_arc.read().await.clone();
-        if let Err(e) = save_transformer(&t, id, data_dir).await {
-            eprintln!("[neuralcabin] {e}");
+        let (sig, transformer) = {
+            let guard = t_arc.read().await;
+            let sig = guard.weights_signature();
+            (sig, if needs_write(state, id, sig).await { Some(guard.clone()) } else { None })
+        };
+        if let Some(t) = transformer {
+            match save_transformer(&t, id, data_dir).await {
+                Ok(()) => { state.saved_sigs.write().await.insert(id.clone(), sig); }
+                Err(e) => eprintln!("[neuralcabin] {e}"),
+            }
         }
     }
     Ok(())
+}
+
+/// True if the weight file for `id` is missing from the signature cache or its
+/// recorded signature differs from `sig` — i.e. the weights changed (or were
+/// never written) and the file must be (re)written.
+async fn needs_write(state: &AppState, id: &str, sig: u64) -> bool {
+    state.saved_sigs.read().await.get(id).copied() != Some(sig)
 }
 
 pub async fn save_persisted(persisted: &PersistedState, data_dir: &Path) -> Result<(), String> {
@@ -501,6 +533,49 @@ mod tests {
 
         let model = load_model("net-1", &dir).await.expect("ok").expect("exists");
         assert_eq!(model.input_dim, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A metadata-only save must NOT rewrite an unchanged model's weight file,
+    /// but a save after the weights change must. We detect the (non-)write by
+    /// clobbering the file with a sentinel between saves: if the skip logic
+    /// works the sentinel survives an unchanged save and is replaced only once
+    /// the in-memory model actually differs.
+    #[tokio::test]
+    async fn unchanged_model_is_not_rewritten() {
+        let dir = tempdir();
+        let state = AppState::new();
+        let arc = Arc::new(RwLock::new(sample_model()));
+        state.networks.write().await.insert("net-1".into(), sample_network("net-1"));
+        state.models.write().await.insert("net-1".into(), arc.clone());
+
+        // First save writes the real model and records its signature.
+        save_to_dir(&state, &dir).await.expect("first save");
+        let model_file = dir.join("models").join("net-1.json");
+        assert!(model_file.exists());
+
+        // Clobber the file so any rewrite is observable.
+        std::fs::write(&model_file, b"SENTINEL").unwrap();
+
+        // Metadata-only change: rename the network, model weights untouched.
+        state.networks.write().await.get_mut("net-1").unwrap().name = "renamed".into();
+        save_to_dir(&state, &dir).await.expect("metadata save");
+        assert_eq!(
+            std::fs::read(&model_file).unwrap(), b"SENTINEL",
+            "unchanged model weight file was needlessly rewritten"
+        );
+
+        // Now actually change the weights → the file must be rewritten.
+        arc.write().await.layers.iter_mut().for_each(|l| {
+            if let neuralcabin_engine::nn::Layer::Linear(ll) = l { ll.w.data[0] += 1.0; }
+        });
+        save_to_dir(&state, &dir).await.expect("weights save");
+        let after = std::fs::read(&model_file).unwrap();
+        assert_ne!(after, b"SENTINEL", "changed model weight file was not rewritten");
+        // And it must be a valid model again.
+        let reloaded = load_model("net-1", &dir).await.expect("ok").expect("exists");
+        assert_eq!(reloaded.input_dim, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

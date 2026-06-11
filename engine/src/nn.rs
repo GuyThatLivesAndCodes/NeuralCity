@@ -236,6 +236,38 @@ impl Model {
         self.layers.iter().map(|l| l.parameter_count()).sum()
     }
 
+    /// A cheap 64-bit content signature over everything that gets serialized.
+    /// Two models share a signature iff their on-disk JSON would be identical,
+    /// so the persistence layer can skip rewriting an unchanged weight file
+    /// without ever serializing or touching the disk to find out.
+    ///
+    /// NOTE: if a new serialized field is ever added to `Model` / `LinearLayer`,
+    /// mix it into this hash too, otherwise a change to that field alone could
+    /// be skipped on save. Covered by `weights_signature_detects_change`.
+    pub fn weights_signature(&self) -> u64 {
+        use crate::tensor::{fnv_u32, fnv_u64, fnv_usize, FNV_OFFSET};
+        let mut h = FNV_OFFSET;
+        fnv_usize(&mut h, self.input_dim);
+        fnv_u64(&mut h, self.seed);
+        fnv_usize(&mut h, self.layers.len());
+        for layer in &self.layers {
+            match layer {
+                Layer::Linear(l) => {
+                    fnv_u32(&mut h, 0);
+                    fnv_usize(&mut h, l.in_dim);
+                    fnv_usize(&mut h, l.out_dim);
+                    l.w.hash_into(&mut h);
+                    l.b.hash_into(&mut h);
+                }
+                Layer::Activation(a) => {
+                    fnv_u32(&mut h, 1);
+                    fnv_u32(&mut h, *a as u32);
+                }
+            }
+        }
+        h
+    }
+
     pub fn parameter_shapes(&self) -> Vec<Vec<usize>> {
         let mut out = Vec::new();
         for l in &self.layers {
@@ -597,6 +629,34 @@ fn predict_cpu(model: &Model, input: &Tensor) -> Tensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The weights signature must be stable for an unchanged model and must
+    /// change whenever any weight does — that's the property the persistence
+    /// layer relies on to skip rewriting unchanged weight files safely.
+    #[test]
+    fn weights_signature_detects_change() {
+        let specs = vec![
+            LayerSpec::Linear { in_dim: 2, out_dim: 4 },
+            LayerSpec::Activation(Activation::ReLU),
+            LayerSpec::Linear { in_dim: 4, out_dim: 1 },
+        ];
+        let model = Model::from_specs(2, &specs, 7);
+        let sig = model.weights_signature();
+        // Stable: recomputing and cloning don't change it.
+        assert_eq!(sig, model.weights_signature());
+        assert_eq!(sig, model.clone().weights_signature());
+
+        // A different seed (different initial weights) changes the signature.
+        let other = Model::from_specs(2, &specs, 8);
+        assert_ne!(sig, other.weights_signature());
+
+        // Perturbing a single weight changes the signature.
+        let mut mutated = model.clone();
+        if let Layer::Linear(l) = &mut mutated.layers[0] {
+            l.w.data[0] += 1e-3;
+        }
+        assert_ne!(sig, mutated.weights_signature());
+    }
 
     /// XOR is the canonical "non-linearly separable" problem.  A small MLP must
     /// learn it; we assert the model converges below loss < 0.10 within budget.

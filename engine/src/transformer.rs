@@ -106,6 +106,42 @@ impl TransformerModel {
         }
         n
     }
+
+    /// A cheap 64-bit content signature over everything that gets serialized.
+    /// Lets the persistence layer skip rewriting an unchanged transformer
+    /// weight file without serializing it or reading the disk. See
+    /// `nn::Model::weights_signature` for the rationale; if a serialized field
+    /// is added to the config or block weights, mix it in here too.
+    pub fn weights_signature(&self) -> u64 {
+        use crate::tensor::{fnv_u32, fnv_u64, fnv_usize, FNV_OFFSET};
+        let mut h = FNV_OFFSET;
+        let c = &self.config;
+        fnv_usize(&mut h, c.vocab_size);
+        fnv_usize(&mut h, c.n_ctx);
+        fnv_usize(&mut h, c.n_embd);
+        fnv_usize(&mut h, c.n_layers);
+        fnv_usize(&mut h, c.n_heads);
+        fnv_usize(&mut h, c.n_ff);
+        fnv_u32(&mut h, c.rope_theta.to_bits());
+        fnv_u32(&mut h, c.rms_eps.to_bits());
+        fnv_u64(&mut h, self.seed);
+        self.token_embd.hash_into(&mut h);
+        fnv_usize(&mut h, self.blocks.len());
+        for b in &self.blocks {
+            b.attn_norm.hash_into(&mut h);
+            b.wq.hash_into(&mut h);
+            b.wk.hash_into(&mut h);
+            b.wv.hash_into(&mut h);
+            b.wo.hash_into(&mut h);
+            b.ffn_norm.hash_into(&mut h);
+            b.ffn_gate.hash_into(&mut h);
+            b.ffn_up.hash_into(&mut h);
+            b.ffn_down.hash_into(&mut h);
+        }
+        self.output_norm.hash_into(&mut h);
+        self.output.hash_into(&mut h);
+        h
+    }
 }
 
 fn scaled_randn(shape: Vec<usize>, scale: f32, rng: &mut SplitMix64) -> Tensor {
@@ -745,6 +781,29 @@ mod tests {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
         }
+    }
+
+    #[test]
+    fn weights_signature_detects_change() {
+        let cfg = tiny_config(10);
+        let model = TransformerModel::new(cfg.clone(), 1);
+        let sig = model.weights_signature();
+        assert_eq!(sig, model.weights_signature());
+        assert_eq!(sig, model.clone().weights_signature());
+
+        // Different seed → different weights → different signature.
+        let other = TransformerModel::new(cfg, 2);
+        assert_ne!(sig, other.weights_signature());
+
+        // Mutating a single block weight flips the signature.
+        let mut mutated = model.clone();
+        mutated.blocks[0].wq.data[0] += 1e-3;
+        assert_ne!(sig, mutated.weights_signature());
+
+        // Mutating the LM head too.
+        let mut mutated2 = model.clone();
+        mutated2.output.data[0] += 1e-3;
+        assert_ne!(sig, mutated2.weights_signature());
     }
 
     #[test]
