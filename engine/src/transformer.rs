@@ -726,6 +726,69 @@ pub fn forward_logits<B: Backend>(
     logits.into_data().convert::<f32>().into_vec().unwrap()
 }
 
+/// A long-lived **inference** session for autoregressive generation.
+///
+/// Building the Burn module uploads every weight tensor to the device, and
+/// the RoPE/causal-mask tables cost `O(seq_len²)` to fill. Autoregressive
+/// decoding calls forward once per generated token, so doing that work each
+/// step (as `forward_logits` does) re-uploads the entire model and rebuilds
+/// the trig/mask tables for every token — by far the dominant cost for a
+/// frozen model.
+///
+/// This session uploads the model **once** and memoizes the RoPE/mask tables
+/// per `seq_len` (NeuralCabin pads the context window to a fixed `n_ctx`, so
+/// the tables are built once and reused for the whole run). It also slices the
+/// final position **on the device**, so each step pulls back only `vocab_size`
+/// floats instead of `seq_len × vocab_size`.
+/// Memoized per-`seq_len` RoPE/mask tables: `(seq_len, cos, sin, mask)`.
+type RopeMaskCache<B> = (usize, BT<B, 2>, BT<B, 2>, BT<B, 2, burn::tensor::Bool>);
+
+pub struct InferenceSession<B: Backend> {
+    net: BurnTransformer<B>,
+    cfg: TransformerConfig,
+    device: B::Device,
+    /// Reused while `seq_len` is unchanged.
+    cache: Option<RopeMaskCache<B>>,
+}
+
+impl<B: Backend> InferenceSession<B> {
+    /// Upload `model` to `device` once. Cheap to call relative to a single
+    /// forward pass; the win is reusing the result across many tokens.
+    pub fn new(model: &TransformerModel, device: B::Device) -> Self {
+        let cfg = model.config.clone();
+        let net = BurnTransformer::<B>::from_model(model, &device);
+        Self { net, cfg, device, cache: None }
+    }
+
+    /// Run a forward pass over `tokens` and return only the logits at the
+    /// **last** position (length `vocab_size`). This is exactly what
+    /// autoregressive sampling needs.
+    pub fn last_logits(&mut self, tokens: &[u32]) -> Vec<f32> {
+        let seq_len = tokens.len();
+        let head_dim = self.cfg.n_embd / self.cfg.n_heads;
+
+        // (Re)build RoPE/mask tables only when the sequence length changes.
+        let need_rebuild = !matches!(&self.cache, Some((cached, ..)) if *cached == seq_len);
+        if need_rebuild {
+            let (cos, sin) = rope_tables::<B>(seq_len, head_dim, self.cfg.rope_theta, &self.device);
+            let mask = causal_mask::<B>(seq_len, &self.device);
+            self.cache = Some((seq_len, cos, sin, mask));
+        }
+        let (_, cos, sin, mask) = self.cache.as_ref().unwrap();
+
+        let input_i64: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+        let x = BT::<B, 2, Int>::from_data(TensorData::new(input_i64, [1, seq_len]), &self.device);
+
+        let vocab = self.cfg.vocab_size;
+        let logits = self.net.forward(x, &self.cfg, cos, sin, mask); // (1, T, vocab)
+        // Keep only the final position on-device before the GPU→CPU copy.
+        let last = logits
+            .slice([0..1, seq_len - 1..seq_len, 0..vocab])
+            .reshape([vocab]);
+        last.into_data().convert::<f32>().into_vec().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +819,32 @@ mod tests {
         let logits = forward_logits::<CpuBackend>(&model, &tokens, &device);
         assert_eq!(logits.len(), 8 * 10);
         assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn inference_session_matches_forward_logits() {
+        let cfg = tiny_config(10);
+        let model = TransformerModel::new(cfg.clone(), 7);
+        let device = <CpuBackend as Backend>::Device::default();
+        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
+        let vocab = cfg.vocab_size;
+
+        // Full path: logits at every position, take the last row.
+        let full = forward_logits::<CpuBackend>(&model, &tokens, &device);
+        let expected_last = &full[full.len() - vocab..];
+
+        // Session path: last-position logits, sliced on-device.
+        let mut session = InferenceSession::<CpuBackend>::new(&model, device);
+        let last = session.last_logits(&tokens);
+        assert_eq!(last.len(), vocab);
+
+        for (a, b) in last.iter().zip(expected_last) {
+            assert!((a - b).abs() < 1e-4, "mismatch: {a} vs {b}");
+        }
+
+        // A second call (same seq_len) must reuse cached tables and still match.
+        let last2 = session.last_logits(&tokens);
+        assert_eq!(last, last2);
     }
 
     /// Train on a trivial deterministic sequence and check that the loss
