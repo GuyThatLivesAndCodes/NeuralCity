@@ -192,17 +192,30 @@ impl Vocabulary {
 
     /// Greedy longest-match tokenization. Characters with no matching vocab
     /// entry are emitted as `<unk>`.
+    ///
+    /// This runs over the entire corpus when building training tensors, so it
+    /// is a hot path. Rather than allocating a fresh `String` for every
+    /// (position, candidate-length) probe, we precompute char→byte boundaries
+    /// once and look candidates up as zero-copy `&str` slices of the original
+    /// text — `HashMap<String, _>::get` accepts `&str` via `Borrow`, so no
+    /// per-probe allocation is needed.
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let chars: Vec<char> = text.chars().collect();
-        let mut out = Vec::with_capacity(chars.len());
+        // `offsets[k]` is the byte index where the k-th char starts; the final
+        // entry is `text.len()`, so `&text[offsets[i]..offsets[i + len]]` is a
+        // valid `len`-char slice at a char boundary for any `i + len <= n`.
+        let mut offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+        offsets.push(text.len());
+        let n = offsets.len() - 1;
+
+        let mut out = Vec::with_capacity(n);
         let mut i = 0;
-        while i < chars.len() {
+        while i < n {
             let mut matched = false;
             for &len in &self.sorted_lengths {
-                if len == 0 || i + len > chars.len() { continue; }
-                // Build the candidate substring deterministically.
-                let candidate: String = chars[i..i + len].iter().collect();
-                if let Some(&id) = self.index.get(&candidate) {
+                if len == 0 || i + len > n { continue; }
+                // Zero-copy candidate slice spanning `len` chars from `i`.
+                let candidate = &text[offsets[i]..offsets[i + len]];
+                if let Some(&id) = self.index.get(candidate) {
                     out.push(id);
                     i += len;
                     matched = true;
@@ -211,8 +224,8 @@ impl Vocabulary {
             }
             if !matched {
                 // Try a single-character lookup (Char-mode fallback / any mode).
-                let single: String = chars[i].to_string();
-                if let Some(&id) = self.index.get(&single) {
+                let single = &text[offsets[i]..offsets[i + 1]];
+                if let Some(&id) = self.index.get(single) {
                     out.push(id);
                 } else {
                     out.push(UNK_ID);
@@ -384,6 +397,25 @@ mod tests {
         let ids = v.encode("helloworld");
         assert_eq!(v.token_of(ids[0]), "hello");
         assert_eq!(v.token_of(ids[1]), "world");
+    }
+
+    #[test]
+    fn encode_handles_multibyte_unicode() {
+        // Multi-byte chars exercise the char→byte offset slicing: greedy
+        // longest-match must still prefer the whole word and round-trip.
+        let v = Vocabulary::build(
+            TokenizerMode::Word,
+            &["café déjà café déjà"],
+            &VocabularyOptions { subword_merges: 0, word_top_n: 10 },
+        );
+        let ids = v.encode("café déjà");
+        // Whole multi-byte words should be matched as single tokens.
+        assert_eq!(v.token_of(ids[0]), "café");
+        assert_eq!(v.token_of(*ids.last().unwrap()), "déjà");
+        assert_eq!(v.decode(&v.encode("café déjà")), "café déjà");
+        // An out-of-vocab multi-byte char falls back to <unk>, not a panic.
+        let ids2 = v.encode("café ☃");
+        assert_eq!(*ids2.last().unwrap(), UNK_ID);
     }
 
     #[test]
