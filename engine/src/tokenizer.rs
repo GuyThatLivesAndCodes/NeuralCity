@@ -192,17 +192,31 @@ impl Vocabulary {
 
     /// Greedy longest-match tokenization. Characters with no matching vocab
     /// entry are emitted as `<unk>`.
+    ///
+    /// Candidate substrings are taken as borrowed `&str` slices of the input
+    /// via precomputed char→byte offsets, so the greedy match performs *zero*
+    /// per-candidate heap allocations. (The previous version collected each
+    /// candidate into a fresh `String` for the `HashMap` lookup — up to
+    /// `sorted_lengths.len()` allocations per character, which dominated
+    /// corpus tokenization time.) `HashMap<String, _>::get` accepts a `&str`
+    /// because `String: Borrow<str>`, so the lookups are unchanged.
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let chars: Vec<char> = text.chars().collect();
-        let mut out = Vec::with_capacity(chars.len());
+        // Byte offset of each char start, with `text.len()` appended as a
+        // sentinel so `offsets[i]..offsets[i + len]` is always a valid range.
+        let mut offsets: Vec<usize> = Vec::with_capacity(text.len() + 1);
+        offsets.extend(text.char_indices().map(|(b, _)| b));
+        offsets.push(text.len());
+        let n_chars = offsets.len() - 1;
+
+        let mut out = Vec::with_capacity(n_chars);
         let mut i = 0;
-        while i < chars.len() {
+        while i < n_chars {
             let mut matched = false;
             for &len in &self.sorted_lengths {
-                if len == 0 || i + len > chars.len() { continue; }
-                // Build the candidate substring deterministically.
-                let candidate: String = chars[i..i + len].iter().collect();
-                if let Some(&id) = self.index.get(&candidate) {
+                if len == 0 || i + len > n_chars { continue; }
+                // Borrow the candidate directly from the source text.
+                let candidate = &text[offsets[i]..offsets[i + len]];
+                if let Some(&id) = self.index.get(candidate) {
                     out.push(id);
                     i += len;
                     matched = true;
@@ -211,8 +225,8 @@ impl Vocabulary {
             }
             if !matched {
                 // Try a single-character lookup (Char-mode fallback / any mode).
-                let single: String = chars[i].to_string();
-                if let Some(&id) = self.index.get(&single) {
+                let single = &text[offsets[i]..offsets[i + 1]];
+                if let Some(&id) = self.index.get(single) {
                     out.push(id);
                 } else {
                     out.push(UNK_ID);
@@ -384,6 +398,24 @@ mod tests {
         let ids = v.encode("helloworld");
         assert_eq!(v.token_of(ids[0]), "hello");
         assert_eq!(v.token_of(ids[1]), "world");
+    }
+
+    #[test]
+    fn encode_handles_multibyte_unicode() {
+        // Greedy match must operate on character boundaries, not bytes:
+        // emoji and accented letters are multi-byte in UTF-8, and the
+        // byte-offset slicing must reproduce the exact char substrings.
+        let v = Vocabulary::build(
+            TokenizerMode::Word,
+            &["café 🚀 café 🚀"],
+            &VocabularyOptions { subword_merges: 0, word_top_n: 5 },
+        );
+        let ids = v.encode("café 🚀");
+        // Round-trips back to the original text (reserved tokens are dropped,
+        // but none are produced here).
+        assert_eq!(v.decode(&ids), "café 🚀");
+        // The whole word "café" should match as a single token, not 4 chars.
+        assert_eq!(v.token_of(ids[0]), "café");
     }
 
     #[test]
