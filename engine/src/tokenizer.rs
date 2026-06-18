@@ -195,14 +195,22 @@ impl Vocabulary {
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let chars: Vec<char> = text.chars().collect();
         let mut out = Vec::with_capacity(chars.len());
+        // Reusable scratch buffer for candidate substrings. Cleared and refilled
+        // per probe so the inner loop performs no heap allocation — previously a
+        // fresh `String` was allocated for every candidate length at every
+        // position, i.e. O(chars * distinct_lengths) allocations over a corpus.
+        // `HashMap<String, _>::get` borrows the key as `&str`, so the buffer
+        // never needs to be cloned to look up.
+        let mut buf = String::new();
         let mut i = 0;
         while i < chars.len() {
             let mut matched = false;
             for &len in &self.sorted_lengths {
                 if len == 0 || i + len > chars.len() { continue; }
-                // Build the candidate substring deterministically.
-                let candidate: String = chars[i..i + len].iter().collect();
-                if let Some(&id) = self.index.get(&candidate) {
+                // Build the candidate substring deterministically into `buf`.
+                buf.clear();
+                buf.extend(&chars[i..i + len]);
+                if let Some(&id) = self.index.get(buf.as_str()) {
                     out.push(id);
                     i += len;
                     matched = true;
@@ -211,8 +219,9 @@ impl Vocabulary {
             }
             if !matched {
                 // Try a single-character lookup (Char-mode fallback / any mode).
-                let single: String = chars[i].to_string();
-                if let Some(&id) = self.index.get(&single) {
+                buf.clear();
+                buf.push(chars[i]);
+                if let Some(&id) = self.index.get(buf.as_str()) {
                     out.push(id);
                 } else {
                     out.push(UNK_ID);
@@ -367,6 +376,25 @@ mod tests {
         // First and last should be the word tokens, not 3 chars each.
         assert_eq!(v.token_of(ids[0]), "the");
         assert_eq!(v.token_of(*ids.last().unwrap()), "cat");
+    }
+
+    #[test]
+    fn greedy_match_handles_mixed_token_lengths() {
+        // A vocab with tokens of several different lengths exercises the
+        // reusable-buffer probe loop across multiple `sorted_lengths`. Greedy
+        // longest-match must still hold, and re-running encode (which reuses the
+        // scratch buffer) must be deterministic.
+        let v = Vocabulary::build(
+            TokenizerMode::Word,
+            &["the theatre at theater the at"],
+            &VocabularyOptions { subword_merges: 0, word_top_n: 20 },
+        );
+        let ids = v.encode("theatre at the");
+        // "theatre" (7) must win over the shorter "theater"/"the"/"at" prefixes.
+        assert_eq!(v.token_of(ids[0]), "theatre");
+        assert_eq!(v.token_of(*ids.last().unwrap()), "the");
+        // Buffer reuse must not corrupt state between calls.
+        assert_eq!(v.encode("theatre at the"), ids);
     }
 
     #[test]

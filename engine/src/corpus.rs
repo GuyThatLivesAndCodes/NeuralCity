@@ -74,8 +74,15 @@ pub fn build_finetuning_tensors(
 ) -> Option<(Tensor, Tensor)> {
     assert!(context_size > 0, "context_size must be positive");
     let v = vocab.size();
-    let mut x_rows: Vec<Vec<f32>> = Vec::new();
-    let mut y_rows: Vec<u32> = Vec::new();
+    let row_len = context_size * v;
+    // Fill the one-hot feature matrix directly into a single flat buffer instead
+    // of collecting a `Vec<Vec<f32>>` of per-row windows and copying them all
+    // into a flat tensor afterwards. The old two-stage approach held every row
+    // as its own heap allocation *and* a second full-size flat copy at the end,
+    // roughly doubling peak memory for what is the largest tensor in next-token
+    // training (n_examples × context_size × vocab_size floats).
+    let mut x_flat: Vec<f32> = Vec::new();
+    let mut y_ids: Vec<u32> = Vec::new();
 
     for pair in pairs {
         let mut seq: Vec<u32> = Vec::new();
@@ -93,36 +100,35 @@ pub fn build_finetuning_tensors(
             let target = seq[i + 1];
             if mask_user_tokens && (i + 1) < output_start { continue; }
 
-            // Build context: last `context_size` tokens up to and including `i`,
+            // Append a fresh zeroed window, then set the one-hot bits in place.
+            // Context: last `context_size` tokens up to and including `i`,
             // left-padded with PAD if shorter.
-            let mut window = vec![0.0_f32; context_size * v];
+            let base = x_flat.len();
+            x_flat.resize(base + row_len, 0.0);
             let start = (i + 1).saturating_sub(context_size);
             let prefix_len = (i + 1) - start;
             let pad_len = context_size - prefix_len;
             for p in 0..pad_len {
-                window[p * v + PAD_ID as usize] = 1.0;
+                x_flat[base + p * v + PAD_ID as usize] = 1.0;
             }
             for (offset, &tok) in seq[start..=i].iter().enumerate() {
                 let pos = pad_len + offset;
-                window[pos * v + tok as usize] = 1.0;
+                x_flat[base + pos * v + tok as usize] = 1.0;
             }
-            x_rows.push(window);
-            y_rows.push(target);
+            y_ids.push(target);
         }
     }
 
-    if x_rows.is_empty() { return None; }
+    if y_ids.is_empty() { return None; }
 
-    let n = x_rows.len();
-    let mut x_flat = Vec::with_capacity(n * context_size * v);
-    for row in &x_rows { x_flat.extend_from_slice(row); }
+    let n = y_ids.len();
     let mut y_flat = vec![0.0_f32; n * v];
-    for (i, &t) in y_rows.iter().enumerate() {
+    for (i, &t) in y_ids.iter().enumerate() {
         y_flat[i * v + t as usize] = 1.0;
     }
 
     Some((
-        Tensor::new(vec![n, context_size * v], x_flat),
+        Tensor::new(vec![n, row_len], x_flat),
         Tensor::new(vec![n, v], y_flat),
     ))
 }
