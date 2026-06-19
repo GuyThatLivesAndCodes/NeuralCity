@@ -2036,6 +2036,17 @@ async fn infer_transformer(
         let mut rng = SplitMix64::new(0xDEAD_BEEF_u64 ^ (max_new as u64).wrapping_mul(0x9E3779B1));
         let device = neuralcabin_engine::default_gpu_device();
 
+        // Upload the weights and build the RoPE/mask tables once for the whole
+        // run. The window length is always exactly `n_ctx` (left-padded when
+        // the context is short), so a single resident session serves every
+        // token — turning N per-token weight uploads into one.
+        let session = {
+            let model = model_arc.read().await;
+            neuralcabin_engine::transformer::InferenceSession::<
+                neuralcabin_engine::GpuBackend,
+            >::new(&model, n_ctx, device)
+        };
+
         for index in 0..max_new {
             if cancel.load(Ordering::Relaxed) {
                 let _ = app_clone.emit("inference_finished", InferenceFinished {
@@ -2047,23 +2058,17 @@ async fn infer_transformer(
                 break;
             }
             // Take the last n_ctx tokens; pad-left with EOS if shorter.
-            let mut window: Vec<u32> = if ids.len() >= n_ctx {
+            let window: Vec<u32> = if ids.len() >= n_ctx {
                 ids[ids.len() - n_ctx..].to_vec()
             } else {
                 let mut w = vec![EOS_ID; n_ctx - ids.len()];
                 w.extend_from_slice(&ids);
                 w
             };
-            // forward returns logits for every position; we want the LAST one.
-            let model = model_arc.read().await;
-            let logits = neuralcabin_engine::transformer::forward_logits::<
-                neuralcabin_engine::GpuBackend,
-            >(&model, &window, &device);
-            drop(model);
-            let vocab_sz = vocab.size();
-            let last_row = &logits[logits.len() - vocab_sz..];
+            // Only the last position's logits come back from the device.
+            let row_logits = session.logits_last(&window);
             // softmax for sampling.
-            let mut row = last_row.to_vec();
+            let mut row = row_logits;
             let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             for v in row.iter_mut() { *v = (*v - mx).exp(); }
             let s: f32 = row.iter().sum();
@@ -2084,9 +2089,6 @@ async fn infer_transformer(
             });
             if (chosen as u32) == EOS_ID { break; }
             ids.push(chosen as u32);
-            // Suppress unused warning while we keep the variable for future
-            // KV-cache work — the window is recomputed every step today.
-            let _ = &mut window;
             tokio::task::yield_now().await;
         }
         let _ = app_clone.emit("inference_finished", InferenceFinished {
