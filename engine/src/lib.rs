@@ -31,4 +31,4 @@ pub use nn::{
 pub use optimizer::{Optimizer, OptimizerKind};
 pub use tensor::Tensor;
 pub use tokenizer::{TokenizerMode, Vocabulary};
-pub use transformer::{FrozenSnapshotGpu, TrainerSession};
+pub use transformer::{FrozenSnapshotGpu, InferenceSession, TrainerSession};
