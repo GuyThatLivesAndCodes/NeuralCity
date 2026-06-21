@@ -192,17 +192,45 @@ impl Vocabulary {
 
     /// Greedy longest-match tokenization. Characters with no matching vocab
     /// entry are emitted as `<unk>`.
+    ///
+    /// The candidate substrings at a position are nested prefixes (the
+    /// length-`L` candidate is the first `L` chars of the length-`max` one), so
+    /// we materialize the longest window once per position into a reusable
+    /// buffer and probe shorter lengths by slicing it at recorded char→byte
+    /// offsets. That keeps the whole encode allocation-free in its inner loop
+    /// (the previous version built and threw away a fresh `String` for every
+    /// candidate length at every position — the dominant cost when tokenizing a
+    /// large corpus at the start of training).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let chars: Vec<char> = text.chars().collect();
-        let mut out = Vec::with_capacity(chars.len());
+        let n = chars.len();
+        let mut out = Vec::with_capacity(n);
+
+        // Longest token length (in chars); `sorted_lengths` is sorted desc.
+        let max_len = self.sorted_lengths.first().copied().unwrap_or(1).max(1);
+
+        // Reused across positions: `window` holds up to `max_len` chars from the
+        // current position; `offsets[k]` is the byte length of its first `k`
+        // chars, so `&window[..offsets[len]]` is the length-`len` candidate.
+        let mut window = String::new();
+        let mut offsets: Vec<usize> = Vec::with_capacity(max_len + 1);
+
         let mut i = 0;
-        while i < chars.len() {
+        while i < n {
+            let avail = (n - i).min(max_len);
+            window.clear();
+            offsets.clear();
+            offsets.push(0);
+            for &c in &chars[i..i + avail] {
+                window.push(c);
+                offsets.push(window.len());
+            }
+
             let mut matched = false;
             for &len in &self.sorted_lengths {
-                if len == 0 || i + len > chars.len() { continue; }
-                // Build the candidate substring deterministically.
-                let candidate: String = chars[i..i + len].iter().collect();
-                if let Some(&id) = self.index.get(&candidate) {
+                if len == 0 || len > avail { continue; }
+                let candidate = &window[..offsets[len]];
+                if let Some(&id) = self.index.get(candidate) {
                     out.push(id);
                     i += len;
                     matched = true;
@@ -211,8 +239,9 @@ impl Vocabulary {
             }
             if !matched {
                 // Try a single-character lookup (Char-mode fallback / any mode).
-                let single: String = chars[i].to_string();
-                if let Some(&id) = self.index.get(&single) {
+                // `offsets[1]` is always valid here since `i < n` ⇒ `avail ≥ 1`.
+                let single = &window[..offsets[1]];
+                if let Some(&id) = self.index.get(single) {
                     out.push(id);
                 } else {
                     out.push(UNK_ID);
@@ -384,6 +413,60 @@ mod tests {
         let ids = v.encode("helloworld");
         assert_eq!(v.token_of(ids[0]), "hello");
         assert_eq!(v.token_of(ids[1]), "world");
+    }
+
+    #[test]
+    fn encode_handles_multibyte_chars() {
+        // Greedy match must respect UTF-8 char boundaries when slicing the
+        // reused window buffer — a naive byte slice would split "é"/"🦀".
+        let v = Vocabulary::build(
+            TokenizerMode::Word,
+            &["café 🦀 café 🦀 rust café"],
+            &VocabularyOptions { subword_merges: 0, word_top_n: 10 },
+        );
+        // "café" is a learned whole-word token; "🦀" is a single char token.
+        let ids = v.encode("café 🦀");
+        assert_eq!(v.token_of(ids[0]), "café");
+        // Round-trips verbatim — the space is a real char token, not reserved.
+        assert_eq!(v.decode(&ids), "café 🦀");
+    }
+
+    #[test]
+    fn encode_matches_reference_over_mixed_lengths() {
+        // Build a vocab with tokens of several distinct lengths, then confirm
+        // the optimized encoder reproduces a straightforward reference greedy
+        // matcher byte-for-byte across a non-trivial string.
+        let v = Vocabulary::build(
+            TokenizerMode::Word,
+            &["the theater theme the cat scattered theatrics"],
+            &VocabularyOptions { subword_merges: 30, word_top_n: 50 },
+        );
+        let text = "the theater theme cat";
+        let got = v.encode(text);
+
+        // Reference: rebuild a candidate String per length, as the original did.
+        let chars: Vec<char> = text.chars().collect();
+        let mut expect = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let mut matched = false;
+            for &len in &v.sorted_lengths {
+                if len == 0 || i + len > chars.len() { continue; }
+                let cand: String = chars[i..i + len].iter().collect();
+                if let Some(&id) = v.index.get(&cand) {
+                    expect.push(id);
+                    i += len;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                let single: String = chars[i].to_string();
+                expect.push(v.index.get(&single).copied().unwrap_or(UNK_ID));
+                i += 1;
+            }
+        }
+        assert_eq!(got, expect);
     }
 
     #[test]
