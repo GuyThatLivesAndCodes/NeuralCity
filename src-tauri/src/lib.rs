@@ -2046,13 +2046,24 @@ async fn infer_transformer(
                 });
                 break;
             }
-            // Take the last n_ctx tokens; pad-left with EOS if shorter.
-            let mut window: Vec<u32> = if ids.len() >= n_ctx {
+            // Condition on the most recent n_ctx real tokens, unpadded.
+            //
+            // Training never prepends padding (pretrain uses natural corpus
+            // windows; finetune right-pads), so the model has never seen a
+            // leading run of EOS tokens. Feeding the natural, unpadded sequence
+            // therefore (a) matches the training distribution — left-padding
+            // pollutes attention with tokens the model never trained on and
+            // measurably degrades early generations — and (b) avoids wasting
+            // attention compute: a short prompt now costs O(len²) instead of
+            // O(n_ctx²) per step until the context actually fills up.
+            let window: Vec<u32> = if ids.is_empty() {
+                // No prompt at all: seed with a single sequence boundary token
+                // so the forward pass has at least one position to condition on.
+                vec![EOS_ID]
+            } else if ids.len() > n_ctx {
                 ids[ids.len() - n_ctx..].to_vec()
             } else {
-                let mut w = vec![EOS_ID; n_ctx - ids.len()];
-                w.extend_from_slice(&ids);
-                w
+                ids.clone()
             };
             // forward returns logits for every position; we want the LAST one.
             let model = model_arc.read().await;
@@ -2084,9 +2095,6 @@ async fn infer_transformer(
             });
             if (chosen as u32) == EOS_ID { break; }
             ids.push(chosen as u32);
-            // Suppress unused warning while we keep the variable for future
-            // KV-cache work — the window is recomputed every step today.
-            let _ = &mut window;
             tokio::task::yield_now().await;
         }
         let _ = app_clone.emit("inference_finished", InferenceFinished {

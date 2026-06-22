@@ -758,6 +758,19 @@ mod tests {
         assert!(logits.iter().all(|v| v.is_finite()));
     }
 
+    /// Generation feeds the natural, unpadded context window — which can be as
+    /// short as a single token when the prompt is empty. Guard that the forward
+    /// pass (RoPE tables, 1×1 causal mask, softmax) stays finite at seq_len = 1.
+    #[test]
+    fn forward_handles_single_token() {
+        let cfg = tiny_config(10);
+        let model = TransformerModel::new(cfg.clone(), 1);
+        let device = <CpuBackend as Backend>::Device::default();
+        let logits = forward_logits::<CpuBackend>(&model, &[3], &device);
+        assert_eq!(logits.len(), 10);
+        assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
     /// Train on a trivial deterministic sequence and check that the loss
     /// decreases. The model is tiny so this is more about plumbing than
     /// learning quality.
